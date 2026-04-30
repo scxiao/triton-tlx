@@ -1,3 +1,11 @@
+add_triton_library(TritonAMDTargetUtils
+    TargetUtils.cpp
+
+    LINK_LIBS PUBLIC
+    LLVMCore
+    LLVMSupport
+)
+
 add_triton_library(TritonAMDGPUToLLVM
     AsyncUtility.cpp
     AtomicRMWOpsEmitter.cpp
@@ -23,7 +31,6 @@ add_triton_library(TritonAMDGPUToLLVM
     BuiltinFuncToLLVM.cpp
     Utility.cpp
     TargetInfo.cpp
-    TargetUtils.cpp
     SPMDOpToLLVM.cpp
     SchedInstructions.cpp
     Fp4ToFpOpToLLVM.cpp
@@ -42,6 +49,7 @@ add_triton_library(TritonAMDGPUToLLVM
     TritonGPUToLLVM
     TritonInstrumentToLLVM
     TritonAMDGPUIR
+    TritonAMDTargetUtils
     LLVMCore
     LLVMPasses
     LLVMSupport
