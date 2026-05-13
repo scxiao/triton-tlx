@@ -26,6 +26,9 @@ ISAFamily deduceISAFamily(llvm::StringRef arch);
 // Retursn true if given architecture support V_DOT instruction.
 bool supportsVDot(llvm::StringRef arch);
 
+// Returns true if the given architecture supports buffer_load_to_local.
+bool supportsBufferLoadToLocal(llvm::StringRef arch);
+
 bool isCDNA(ISAFamily isaFamily);
 
 bool isRDNA(ISAFamily isaFamily);

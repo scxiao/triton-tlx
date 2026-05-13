@@ -74,6 +74,11 @@ bool isCDNA(ISAFamily isaFamily) {
   return false;
 }
 
+bool supportsBufferLoadToLocal(llvm::StringRef arch) {
+  ISAFamily family = deduceISAFamily(arch);
+  return family == ISAFamily::CDNA3 || family == ISAFamily::CDNA4;
+}
+
 bool isRDNA(ISAFamily isaFamily) {
   switch (isaFamily) {
   case ISAFamily::RDNA1:
