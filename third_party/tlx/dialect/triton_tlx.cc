@@ -13,6 +13,7 @@
 namespace py = pybind11;
 using namespace ir;
 using namespace mlir;
+namespace tt = triton;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tlx = triton::tlx;

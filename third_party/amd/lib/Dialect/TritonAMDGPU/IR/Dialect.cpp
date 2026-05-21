@@ -70,6 +70,15 @@ void mlir::triton::amdgpu::TritonAMDGPUDialect::initialize() {
 
 namespace mlir::triton::amdgpu {
 
+static size_t linearizeIndex(ArrayRef<unsigned> multiDim,
+                             ArrayRef<unsigned> shape,
+                             ArrayRef<unsigned> order) {
+  size_t linear = 0;
+  for (unsigned dim : llvm::reverse(order))
+    linear = linear * shape[dim] + multiDim[dim];
+  return linear;
+}
+
 std::string getStringFromCoords(mlir::triton::AMD::ElemLocationKey coords) {
   std::string result;
   llvm::raw_string_ostream os(result);
@@ -223,7 +232,7 @@ struct CanonicalizeExtractSliceAndConcat
     auto srcToDstShape = LLVM::AMD::multiDimElementwise<int64_t, int64_t>(
         dstShape, srcShape, std::divides<unsigned>());
     auto linearSrcIdx =
-        mlir::LLVM::linearize(multiDimSrcIdx, srcToDstShape, defaultOrder);
+        linearizeIndex(multiDimSrcIdx, srcToDstShape, defaultOrder);
 
     // Replace extract_slice with the concat operand
     assert(linearSrcIdx < concatOp->getNumOperands() &&
@@ -478,7 +487,7 @@ LogicalResult ConcatOp::verify() {
     auto multiDimOperandIdx = LLVM::AMD::multiDimElementwise<int32_t, int64_t>(
         elemCoordsArray, srcShape, std::divides<unsigned>());
     auto linearOperandIdx =
-        mlir::LLVM::linearize(multiDimOperandIdx, srcToDstShape, defaultOrder);
+        linearizeIndex(multiDimOperandIdx, srcToDstShape, defaultOrder);
 
     // 4.   subtract dst coordinates and start coordinates of the tile
 
@@ -514,7 +523,11 @@ LogicalResult BufferLoadToLocalOp::verify() {
     return success();
 
   auto arch = mlir::getAMDArch(mod);
-  if (!arch || AMD::TargetInfo(arch->str()).supportsBufferLoadToLocal())
+  auto supportsBufferLoadToLocal = [](llvm::StringRef arch) {
+    auto family = AMD::deduceISAFamily(arch);
+    return family == AMD::ISAFamily::CDNA3 || family == AMD::ISAFamily::CDNA4;
+  };
+  if (!arch || supportsBufferLoadToLocal(arch->str()))
     return success();
   return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
