@@ -6,6 +6,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "proton/Dialect/include/Dialect/Proton/IR/Dialect.h"
 #include "third_party/tlx/dialect/include/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -656,6 +657,13 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<GenericOpPattern<triton::tlx::RequireLayoutOp>>(typeConverter, context);
   patterns.add<GenericOpPattern<triton::tlx::ReleaseLayoutOp>>(typeConverter,
                                                            context);
+  // AMD buffer ops emitted by TLX at TTIR level need encoding added
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadOp>>(typeConverter,
+                                                               context);
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferStoreOp>>(typeConverter,
+                                                                context);
+  patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadToLocalOp>>(
+      typeConverter, context);
 }
 
 //

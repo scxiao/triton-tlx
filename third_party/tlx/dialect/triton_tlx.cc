@@ -7,6 +7,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "third_party/amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "llvm/Support/Casting.h"
 
 namespace py = pybind11;
@@ -15,6 +16,7 @@ using namespace mlir;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tlx = triton::tlx;
+namespace ttag = triton::amdgpu;
 
 void init_triton_tlx_ir(py::module &&m) {
   auto *builder_cls = ir::getBuilderClass();
@@ -458,6 +460,36 @@ void init_triton_tlx_ir(py::module &&m) {
       .def("create_fence_async_shared",
            [](TritonOpBuilder &self, bool bCluster) -> OpState {
              return self.create<ttng::FenceAsyncSharedOp>(bCluster);
+           })
+      // AMD buffer ops
+      .def("create_buffer_load",
+           [](TritonOpBuilder &self, Value ptr, Value offsets,
+              std::optional<Value> mask, std::optional<Value> other,
+              mlir::triton::CacheModifier cache) -> Value {
+             auto offsetsType = cast<RankedTensorType>(offsets.getType());
+             auto ptrType = cast<tt::PointerType>(ptr.getType());
+             auto resultType = RankedTensorType::get(
+                 offsetsType.getShape(), ptrType.getPointeeType(),
+                 offsetsType.getEncoding());
+             return self.create<ttag::BufferLoadOp>(
+                 resultType, ptr, offsets, Value() /*stride*/, cache,
+                 mask.value_or(Value()), other.value_or(Value()));
+           })
+      .def("create_buffer_store",
+           [](TritonOpBuilder &self, Value storedValue, Value ptr,
+              Value offsets, std::optional<Value> mask,
+              mlir::triton::CacheModifier cache) {
+             self.create<ttag::BufferStoreOp>(
+                 storedValue, ptr, offsets, Value() /*stride*/, cache,
+                 mask.value_or(Value()));
+           })
+      .def("create_buffer_load_to_local",
+           [](TritonOpBuilder &self, Value dest, Value ptr, Value offsets,
+              std::optional<Value> mask, std::optional<Value> other,
+              tt::CacheModifier cache) -> Value {
+             return self.create<ttag::BufferLoadToLocalOp>(
+                 dest, ptr, offsets, mask.value_or(Value()),
+                 other.value_or(Value()), Value() /*stride*/, cache);
            });
 }
 
@@ -476,6 +508,7 @@ void init_triton_tlx(py::module &&m) {
   m.def("load_dialects", [](mlir::MLIRContext &context) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::triton::tlx::TLXDialect>();
+    registry.insert<ttag::TritonAMDGPUDialect>();
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
   });
