@@ -184,10 +184,19 @@ def _amd_grouped_gemm_fprop_kernel(
         yb = acc_bot.to(y_ptr.dtype.element_ty)
         _workgroup_barrier()
 
-        tl.store(y_ptr + row_t[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+        tl.store(y_ptr + (row_t[:, None] * stride_ym + offs_n[None, :] * stride_yn),
                     yt, mask=smask_mt & mask_n_col)
-        tl.store(y_ptr + row_b[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+        # tl.store(y_ptr + (row_t[:, None] * stride_ym + offs_n[None, :] * stride_yn), yt)
+        
+        rowy_t = tl.arange(0, HALF_M)
+        coly = tl.arange(0, BLOCK_SIZE_N)
+        # offs_t = row_t[:, None] * stride_ym + offs_n[None, :] * stride_yn
+        # tlx.buffer_store(yt, y_ptr, offs_t.to(tl.uint32), mask=smask_mt & mask_n_col)
+        tl.store(y_ptr + (row_b[:, None] * stride_ym + offs_n[None, :] * stride_yn),
                     yb, mask=smask_mb & mask_n_col)
+        # tl.store(y_ptr + (row_b[:, None] * stride_ym + offs_n[None, :] * stride_yn), yb)
+        # offs_b = row_b[:, None] * stride_ym + offs_n[None, :] * stride_yn
+        # tlx.buffer_store(yb, y_ptr, offs_b.to(tl.uint32), mask=smask_mb & mask_n_col)
 
         tile_idx += NUM_CUS
         _workgroup_barrier()
@@ -237,16 +246,29 @@ def _run(n_runs: int) -> None:
     for r in range(n_runs):
         y = amd_grouped_gemm_fprop(x, w)
         yf = y.float()
-        invalid = (yf.abs() > 1e30) | ~torch.isfinite(yf)
+        invalid = (yf.abs() > 1e30) |  ~torch.isfinite(yf)
         nhuge = int(invalid.sum())
-        print(f"  run {r}: nhuge={nhuge}")
+        infinite2 = ~torch.isfinite(yf)
+        infinite_sum = int(infinite2.sum())
+        print(f"large_value_shape = {invalid.shape}")
+        print(f"infinite_shape = {infinite2.shape}")
+        print(f"  run {r}: nhuge={nhuge}, infinite = {infinite_sum}")
         if dump:
-            mask = invalid if dump == "invalid" else (yf != 0)
-            idx = mask.nonzero(as_tuple=False)
-            rc = torch.stack([idx[:, 0] % 256, idx[:, 1] % 256], dim=1)
-            pairs = sorted(torch.unique(rc, dim=0).tolist())
-            print(f"POS[{dump}] n={len(pairs)}: "
-                  + " ".join(f"{a},{b}" for a, b in pairs))
+            mask = invalid.contiguous() if dump == "invalid" else (yf != 0)
+            print(f"mask_shape = {mask.shape}")
+            size = mask.shape[0]
+            print(f"size = {size}")
+            for i in torch.arange(16):
+                print(f"i = {i}")
+                step = size // 16
+                start = i * step
+                end = (i + 1) * step
+                idx = mask[start:end].nonzero(as_tuple=False)
+                print(f"idx_shape = {idx.shape}")
+                rc = torch.stack([idx[:, 0], idx[:, 1]], dim=1)
+                pairs = sorted(torch.unique(rc, dim=0).tolist())
+                # print(f"POS[{dump}] n={len(pairs)}: "
+                #     + " ".join(f"{a + i * step},{b}" for a, b in pairs))
 
 
 def _repro() -> None:
