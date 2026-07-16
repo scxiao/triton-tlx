@@ -207,6 +207,11 @@ SmallVector<unsigned> getRepOrder(RankedTensorType type) {
   return {};
 }
 
+// Forward declaration (defined below).
+SmallVector<unsigned> orderPerDimImpl(const LinearLayout &ll,
+                                      StringAttr dimName,
+                                      ArrayRef<unsigned> defaultOrder);
+
 // Legacy impl for now
 // This one's not terribly bad as we don't broadcast ShareEncodings
 SmallVector<unsigned> getOrder(SharedEncodingTrait layout,
@@ -232,6 +237,38 @@ SmallVector<unsigned> getOrder(SharedEncodingTrait layout,
   if (auto partitionedLayout =
           dyn_cast<PartitionedSharedEncodingAttr>(layout)) {
     return getOrder(partitionedLayout.getPartitionLayout(), shape);
+  }
+  // Generic fallback for encodings that implement SharedEncodingTrait but are
+  // not one of the concrete types above (e.g. a dialect-specific wrapper such
+  // as TLX's UserLayoutAttr).  Derive the order from the inner shared layout's
+  // linear representation by mapping output-dim indices to tensor axis indices
+  // via the standard "dimN" naming convention.
+  {
+    auto kOffset = StringAttr::get(layout.getContext(), "offset");
+    auto ll = toLinearLayout(shape, cast<Attribute>(layout));
+    if (ll.getBases().contains(kOffset)) {
+      unsigned rank = shape.size();
+      SmallVector<unsigned> defaultOrder(rank);
+      std::iota(defaultOrder.rbegin(), defaultOrder.rend(), 0);
+      // orderPerDimImpl returns indices into getOutDimNames(), not axis indices.
+      // Convert: outDimName "dimN" -> axis N.
+      SmallVector<unsigned> outDimOrder =
+          orderPerDimImpl(ll, kOffset, defaultOrder);
+      auto outDimNames = llvm::to_vector(ll.getOutDimNames());
+      SmallVector<unsigned> axisOrder;
+      for (unsigned outIdx : outDimOrder) {
+        StringRef name = outDimNames[outIdx].strref();
+        // Standard names are "dim0", "dim1", etc.
+        unsigned axis;
+        if (name.consume_front("dim") && !name.getAsInteger(10, axis)) {
+          axisOrder.push_back(axis);
+        } else {
+          // Non-standard dim name — fall back to the output-dim index directly.
+          axisOrder.push_back(outIdx);
+        }
+      }
+      return axisOrder;
+    }
   }
   llvm::report_fatal_error("Unimplemented usage of getOrder for MemDescType");
   return {};

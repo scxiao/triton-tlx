@@ -943,6 +943,23 @@ LogicalResult insertRequireLayout(ModuleOp m) {
     bool useAsyncCopy = isFedByAsyncLdsProducer(localLoadOp->getOperand(0));
     bool isBufferLoadToLocal =
         isFedByBufferLoadToLocal(localLoadOp->getOperand(0));
+    // On CDNA3/CDNA4, async_copy_global_to_local ops that pass canUseBufferOps
+    // are converted to buffer_load_to_local by TritonAMDGPUConvertToBufferOps,
+    // which runs between the two TlxPropagateLayout passes. The second
+    // PropagateLayout then propagates the require_layout target back to the
+    // allocation, so the buffer_load_to_local ends up targeting the async
+    // padded layout. That layout fails canLoadDirectToLDS because its permuted
+    // order makes reg->shared consecutiveness < vectorSize. Treat async_copy as
+    // a future buffer_load_to_local on these targets so we use the identity
+    // padded layout (the isBufferLoadToLocal path) from the start.
+    if (useAsyncCopy && !isBufferLoadToLocal) {
+      triton::AMD::TargetInfo targetInfo(
+          getAMDArch(localLoadOp->getParentOfType<ModuleOp>())
+              .value_or("")
+              .str());
+      if (targetInfo.supportsBufferLoadToLocal())
+        isBufferLoadToLocal = true;
+    }
     // For the buffer direct-to-LDS path, source the identity padded order from
     // the producer's real global contiguity (AxisInfo), not a hardcoded
     // K-contiguous order -- this is what makes it correct for any operand
