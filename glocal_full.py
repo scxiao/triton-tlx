@@ -86,16 +86,16 @@ def _amd_grouped_gemm_fprop_kernel(
     HALF_M: tl.constexpr = BLOCK_SIZE_M // 2
     # A uses two [HALF_M,BK] pools (top/bottom).
     buffers_A_top = tlx.local_alloc(
-        (HALF_M, BLOCK_SIZE_K), tlx.dtype_of(x_ptr), NUM_STAGES
+        (HALF_M, BLOCK_SIZE_K), tlx.dtype_of(x_ptr), 1
     )
     buffers_A_bot = tlx.local_alloc(
-        (HALF_M, BLOCK_SIZE_K), tlx.dtype_of(x_ptr), NUM_STAGES
+        (HALF_M, BLOCK_SIZE_K), tlx.dtype_of(x_ptr), 1
     )
     # B staged transposed [BK,BN] (transpose in b_off indices).  The swizzled
     # shared hint is load-bearing at compile time -- a plain layout hits an
     # unrealized_conversion_cast -- though the buffer still lowers to padded.
     buffers_B = tlx.local_alloc(
-        (BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(w_ptr), NUM_STAGES,
+        (BLOCK_SIZE_K, BLOCK_SIZE_N), tlx.dtype_of(w_ptr), 1,
         layout=_swizzled_b_layout([0, 1]),
     )
 
@@ -145,21 +145,21 @@ def _amd_grouped_gemm_fprop_kernel(
         b_mask = kfull[:, None] & mask_n_col
 
         # Prologue: issue async loads for both operands (B before A).
-        for b in tl.static_range(2):
-            tlx.async_load(
-                wb + b * BLOCK_SIZE_K * stride_wk + b_off,
-                tlx.local_view(buffers_B, b), mask=b_mask, other=0.0,
-            )
-            tlx.async_load_commit_group()
-            tlx.async_load(
-                x_base + b * BLOCK_SIZE_K * stride_xk + a_off,
-                tlx.local_view(buffers_A_top, b), mask=a_mask_t, other=0.0,
-            )
-            tlx.async_load(
-                x_base + HALF_M * stride_xm + b * BLOCK_SIZE_K * stride_xk + a_off,
-                tlx.local_view(buffers_A_bot, b), mask=a_mask_b, other=0.0,
-            )
-            tlx.async_load_commit_group()
+        # for b in tl.static_range(1):
+        tlx.async_load(
+            wb + b_off,
+            tlx.local_view(buffers_B, 0), mask=b_mask, other=0.0,
+        )
+        # tlx.async_load_commit_group()
+        tlx.async_load(
+            x_base + a_off,
+            tlx.local_view(buffers_A_top, 0), mask=a_mask_t, other=0.0,
+        )
+        tlx.async_load(
+            x_base + HALF_M * stride_xm + a_off,
+            tlx.local_view(buffers_A_bot, 0), mask=a_mask_b, other=0.0,
+        )
+        tlx.async_load_commit_group()
         tlx.async_load_wait_group(0)
         _workgroup_barrier()
 
@@ -168,35 +168,54 @@ def _amd_grouped_gemm_fprop_kernel(
         oe = 1 - ce
         b_cur = tlx.local_load(tlx.local_view(buffers_B, 0), token=None)
         at_cur = tlx.local_load(tlx.local_view(buffers_A_top, 0), token=None)
-        ab_cur = tlx.local_load(tlx.local_view(buffers_A_bot, ce), token=None)
+        ab_cur = tlx.local_load(tlx.local_view(buffers_A_bot, 0), token=None)
         _workgroup_barrier()
         acc_top = tl.dot(at_cur, b_cur, acc_top)
         acc_bot = tl.dot(ab_cur, b_cur, acc_bot)
-        _workgroup_barrier()
-        b_cur = tlx.local_load(tlx.local_view(buffers_B, oe), token=None)
-        at_cur = tlx.local_load(tlx.local_view(buffers_A_top, oe), token=None)
-        ab_cur = tlx.local_load(tlx.local_view(buffers_A_bot, oe), token=None)
-        acc_top = tl.dot(at_cur, b_cur, acc_top)
-        acc_bot = tl.dot(ab_cur, b_cur, acc_bot)
+        # _workgroup_barrier()
+        # b_cur = tlx.local_load(tlx.local_view(buffers_B, oe), token=None)
+        # at_cur = tlx.local_load(tlx.local_view(buffers_A_top, oe), token=None)
+        # ab_cur = tlx.local_load(tlx.local_view(buffers_A_bot, oe), token=None)
+        # acc_top = tl.dot(at_cur, b_cur, acc_top)
+        # acc_bot = tl.dot(ab_cur, b_cur, acc_bot)
 
         _workgroup_barrier()
         yt = acc_top.to(y_ptr.dtype.element_ty)
         yb = acc_bot.to(y_ptr.dtype.element_ty)
         _workgroup_barrier()
 
-        tl.store(y_ptr + (row_t[:, None] * stride_ym + offs_n[None, :] * stride_yn),
+        tl.store(y_ptr + row_t[:, None] * stride_ym + offs_n[None, :] * stride_yn,
                     yt, mask=smask_mt & mask_n_col)
-        # tl.store(y_ptr + (row_t[:, None] * stride_ym + offs_n[None, :] * stride_yn), yt)
-        
-        rowy_t = tl.arange(0, HALF_M)
-        coly = tl.arange(0, BLOCK_SIZE_N)
-        # offs_t = row_t[:, None] * stride_ym + offs_n[None, :] * stride_yn
-        # tlx.buffer_store(yt, y_ptr, offs_t.to(tl.uint32), mask=smask_mt & mask_n_col)
-        tl.store(y_ptr + (row_b[:, None] * stride_ym + offs_n[None, :] * stride_yn),
+        tl.store(y_ptr + row_b[:, None] * stride_ym + offs_n[None, :] * stride_yn,
                     yb, mask=smask_mb & mask_n_col)
-        # tl.store(y_ptr + (row_b[:, None] * stride_ym + offs_n[None, :] * stride_yn), yb)
-        # offs_b = row_b[:, None] * stride_ym + offs_n[None, :] * stride_yn
-        # tlx.buffer_store(yb, y_ptr, offs_b.to(tl.uint32), mask=smask_mb & mask_n_col)
+
+        # Compute the tile base pointer as a scalar (i64) so the compiler can keep it
+        # in an SGPR pair, leaving only the within-tile (i32) offset in VGPRs.  This
+        # forces non-flat SGPR+VGPR32 global_store addressing and avoids a gfx950
+        # hardware bug: flat global_store_dwordx4 to >2GB addresses with a power-of-2
+        # row stride (stride_ym = 2^18 elements = 2^19 bytes here) corrupts output
+        # because the write coalescer incorrectly merges outstanding 128-bit stores
+        # whose addresses differ by a power of 2.
+        #
+        # Within a tile: within-tile byte offset ≤ (HALF_M-1)*stride_ym*2 + (BN-1)*2
+        # = 127*262144*2 + 255*2 ≈ 63 MB << 2 GB, so i32 is safe.
+
+        # m_base = tile_m.to(tl.int64) * BLOCK_SIZE_M
+        # n_base = tile_n.to(tl.int64) * BLOCK_SIZE_N
+        # y_ptr_tile = y_ptr + m_base * stride_ym + n_base * stride_yn
+
+        # row_wt = tl.arange(0, HALF_M)
+        # row_wb = row_wt + HALF_M
+        # col_w = tl.arange(0, BLOCK_SIZE_N)
+        # # smask_mt = (tile_m * BLOCK_SIZE_M + row_wt)[:, None] < M
+        # # smask_mb = (tile_m * BLOCK_SIZE_M + row_wb)[:, None] < M
+        # # mask_n_col = col_w[None, :] < N
+
+        # tl.store(y_ptr_tile + row_wt[:, None] * stride_ym + col_w[None, :] * stride_yn,
+        #          yt, mask=smask_mt & mask_n_col)
+        # tl.store(y_ptr_tile + row_wb[:, None] * stride_ym + col_w[None, :] * stride_yn,
+        #          yb, mask=smask_mb & mask_n_col)
+
 
         tile_idx += NUM_CUS
         _workgroup_barrier()
@@ -223,6 +242,17 @@ def amd_grouped_gemm_fprop(x, w, *, y=None, num_cus=None):
         BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=32, NUM_STAGES=2,
         num_warps=8, matrix_instr_nonkdim=16, waves_per_eu=0,
     )
+    
+    check_results = bool(os.environ.get("CHECKING", "0"))
+    res_file_name = "result.data"
+    if check_results:
+        print(f"****check_result****")
+        save_results = torch.load(res_file_name)
+        torch.testing.assert_close(y, save_results)
+    else:
+        print(f"****save_results****")
+        torch.save(y, res_file_name)
+    
     return y
 
 
@@ -272,7 +302,7 @@ def _run(n_runs: int) -> None:
 
 
 def _repro() -> None:
-    _run(int(os.environ.get("N_RUNS", "4")))
+    _run(int(os.environ.get("N_RUNS", "1")))
 
 
 # ---------------------------------------------------------------------------
