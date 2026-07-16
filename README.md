@@ -15,6 +15,36 @@ Primarily targeting NVIDIA GPUs (for now), TLX extends Triton to support:
 While this approach places more responsibility on the user, it reduces the compiler's role as a performance bottleneck. Although it may introduce divergence across hardware platforms, it empowers users to perform deeper, architecture-specific optimizations without relying solely on compiler heuristics.
 
 
+## Gluon support
+
+[Gluon](https://github.com/triton-lang/triton/tree/main/python/triton/experimental/gluon)
+(`python/triton/experimental/gluon/`) is **upstream-synced and not a first-class DSL** here
+(TLX is the focus) — do Gluon feature/bug work upstream, not in this fork. But since fbtriton
+is a secondary Triton, we run **fundamental Gluon CI** so we don't silently break it.
+
+**CI:** the `b200-gluon-test` / `mi350-gluon-test` jobs run `pytest python/test/gluon/` (every
+`test_*.py`). It is **green**: ~200 passed, ~1600 skipped, 0 failed. The real signal is the
+compile-only, target-agnostic frontend suite (`test_frontend.py`, one run covers NVIDIA + AMD
+codegen via mock `GPUTarget`); the version-skewed cases below are skipped via
+`python/test/gluon/conftest.py` rather than failing the job.
+
+**Fork-side fixes** (Gluon frontend itself unmodified): `core.py` reduce `reduction_ordering`
+compat, `semantic.py` `dot()` `allow_tf32` default, a `test_core.py` collection fix (a bad
+cherry-pick left an `IndentationError`), and regenerated `test_frontend.py` goldens
+(upstream-synced — overwritten on next sync).
+
+**Skipped, needs upstream Gluon re-sync — TODO(gluon-ci):** the GPU-execution suites
+(`test_core`, `test_lowerings`, `test_consan`, `test_fpsan`, one kernel in
+`test_layout_format_view`) were synced from much newer upstream (e.g. `test_fpsan.py` via bundle
+#1956) than the pinned Gluon frontend (`_semantic.py` ~2026-06-29). They require Gluon behavior
+the frontend doesn't have yet — raw pointer `gl.load`/`gl.store` inferring a *distributed* layout
+— so they fail wholesale with `expected ... distributed_type but got block_type`. The fix is to
+sync the Gluon frontend forward (upstream cherry-pick / re-sync), not a local patch. Also skipped:
+~9 frontend per-target golden tests (single inline golden can't match every parametrized target)
+and the `create_lds_barrier_wait` pybind mismatch. `conftest.py` lists these; remove/trim it after
+the re-sync.
+
+
 ## The DSL Extension
 
 > **Hardware availability tags.** Each op below is tagged with the targets it runs on:
@@ -1048,6 +1078,11 @@ token = tlx.buffer_load_to_local(dest, ptr, offsets, mask=None, other=None, cach
 **Returns**: A `tlx.async_token` that can be used with `tlx.async_load_wait_group()` to synchronize on the completion of the transfer.
 
 Lowers to `amdg.buffer_load_to_local`, which is eventually lowered to `rocdl.raw.ptr.buffer.load.async.lds` — a single hardware instruction that moves data from global memory to LDS without going through VGPRs.
+
+**Requirements.** The direct-to-LDS copy has the following hardware constraints:
+- **Vector width.** Each thread's load must reach a supported direct-to-LDS width (**32 or 128 bits**). If it can only be vectorized to a smaller width, it cannot be lowered.
+- **Provable pointer/offset alignment.** The compiler must be able to *prove* the alignment that vector width needs.
+- **Mask alignment.** If `mask` is given it must be aligned to the vector width: each group of (vector width) consecutive mask values must be identical. The copy transfers each lane's whole vector in one transaction, so a mask whose `True`/`False` boundary cannot be proven vector-aligned (e.g. `offs < K` for a runtime `K`) forces per-element vectorization and cannot lower.
 
 ### Example
 
