@@ -1128,7 +1128,8 @@ void init_gluon_ir(py::module &&m) {
            })
       .def("create_warp_pipeline_border",
            [](GluonOpBuilder &self, const std::string &marker, int priority) {
-             auto border = self.create<ROCDL::SchedBarrier>(0);
+             auto border = self.create<ROCDL::SchedBarrier>(
+                 ROCDL::SchedGroupMask::none);
              auto ctx = self.getContext();
              border->setAttr("triton.warp_pipeline.border",
                              StringAttr::get(ctx, marker));

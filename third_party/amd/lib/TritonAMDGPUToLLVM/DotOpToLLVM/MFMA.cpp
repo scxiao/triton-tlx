@@ -89,7 +89,9 @@ struct DotOpMFMAConversionHelper {
     loweredOp.addOperands({valA, valB, valC});
     loweredOp.addAttribute("cbsz", rewriter.getI32IntegerAttr(cbsz));
     loweredOp.addAttribute("abid", rewriter.getI32IntegerAttr(abid));
-    loweredOp.addAttribute("blgp", rewriter.getI32IntegerAttr(blgp));
+    auto blgpEnum = static_cast<ROCDL::MFMAPermB>(blgp);
+    loweredOp.addAttribute(
+        "blgp", ROCDL::MFMAPermBAttr::get(rewriter.getContext(), blgpEnum));
     return rewriter.create(loweredOp)->getResult(0);
   }
 
@@ -754,9 +756,9 @@ struct ScaledDotOpMFMAConversionHelper : DotOpMFMAConversionHelper {
           for (int n = 0; n < numRepN; ++n) {
             // Insert pingpong cluster barrier when needed.
             if (is2Step && currIter++ == halfPoint) {
-              ROCDL::SchedBarrier::create(rewriter, loc, 0);
+              ROCDL::SchedBarrier::create(rewriter, loc, ROCDL::SchedGroupMask::none);
               ROCDL::SBarrierOp::create(rewriter, loc);
-              ROCDL::SchedBarrier::create(rewriter, loc, 0);
+              ROCDL::SchedBarrier::create(rewriter, loc, ROCDL::SchedGroupMask::none);
             }
             Value acc = tb.undef(vecTy);
             for (unsigned v = 0; v < elemsPerVec; ++v) {

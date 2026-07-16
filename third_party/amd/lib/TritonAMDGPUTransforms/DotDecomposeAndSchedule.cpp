@@ -612,7 +612,7 @@ static LogicalResult applyMSplit(const DotPartitionPlan &plan,
       if (stride > 0 && dotIdx < nM * nN &&
           (dotIdx % static_cast<unsigned>(stride)) == 0) {
         ROCDL::SchedBarrier::create(builder, loc,
-                                    /*mask=*/0);
+                                    ROCDL::SchedGroupMask::none);
       }
     }
   }
@@ -1101,7 +1101,7 @@ static void runAMDModuloScaffold(ModuleOp module) {
         int64_t stage = stageOf(op);
         if (prevStage >= 0 && stage != prevStage) {
           OpBuilder bb(op);
-          ROCDL::SchedBarrier::create(bb, op->getLoc(), /*mask=*/0);
+          ROCDL::SchedBarrier::create(bb, op->getLoc(), ROCDL::SchedGroupMask::none);
           ++nbar;
         }
         prevStage = stage;

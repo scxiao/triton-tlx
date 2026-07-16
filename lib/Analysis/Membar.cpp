@@ -232,7 +232,7 @@ void MembarOrFenceAnalysis::visitTerminator(
     SmallVector<RegionSuccessor> regions;
     br.getSuccessorRegions(RegionBranchPoint::parent(), regions);
     for (RegionSuccessor &region : regions) {
-      if (region.isParent()) {
+      if (region.isOperation()) {
         successors.emplace_back(br->getBlock(), br->getIterator());
       } else {
         Block &block = region.getSuccessor()->front();
@@ -252,7 +252,7 @@ void MembarOrFenceAnalysis::visitTerminator(
     SmallVector<RegionSuccessor> regions;
     br.getSuccessorRegions(operands, regions);
     for (RegionSuccessor &region : regions) {
-      if (region.isParent()) {
+      if (region.isOperation()) {
         Operation *parent = br->getParentOp();
         successors.emplace_back(parent->getBlock(), parent->getIterator());
       } else {

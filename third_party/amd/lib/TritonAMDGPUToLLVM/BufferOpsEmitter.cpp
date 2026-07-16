@@ -127,25 +127,28 @@ BufferEmitter::emitLoadToLds(Type type, Value byteWidth, Value rsrcDesc,
                              Value offset, Value dst, Value pred,
                              triton::CacheModifier cm) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
-  SmallVector<Value, 6> commonArgs;
+  SmallVector<Value> commonArgs;
   fillCommonArgs(type, rsrcDesc, offset, pred, cm, /*isBufferLoad=*/true,
                  commonArgs);
-  Type bufferType = getBufferOpType(type, false);
+
+  // The LLVM ROCDL op takes aux as an attribute (immArg), not a value operand.
+  int32_t auxBits =
+      getCtrlBitsForCacheModifierOnTarget(cm, /*isLoad=*/true, targetInfo);
+  IntegerAttr auxAttr = rewriter.getI32IntegerAttr(auxBits);
 
   // buffer_load_to_lds is only supported on gfx942/gfx950 which always use
   // asyncmark. Emit the async intrinsic so LLVM's SIInsertWaitcnts tracks
   // these operations via asyncmark/wait_asyncmark.
   return ROCDL::RawPtrBufferLoadAsyncLdsOp::create(
-      rewriter, loc, TypeRange{},
-      ValueRange{
-          commonArgs[0], // Buffer descriptor
-          dst,           // LDS base ptr
-          byteWidth,     // Instr size
-          commonArgs[1], // Buffer offset
-          b.i32_val(0),  // LDS offset
-          commonArgs[2], // Instruction offset
-          commonArgs[3], // AUX
-      });
+      rewriter, loc,
+      commonArgs[0], // rsrc: Buffer descriptor
+      dst,           // ldsPtr: LDS base ptr
+      byteWidth,     // size: Instr size
+      commonArgs[1], // voffset: Buffer offset
+      b.i32_val(0),  // soffset: scalar offset
+      commonArgs[2], // offset: Instruction offset
+      auxAttr,       // aux: cache policy (attribute)
+      nullptr, nullptr, nullptr);
 }
 
 Value BufferEmitter::emitAtomicCAS(Type type, Value rsrcDesc, Value offset,

@@ -1000,9 +1000,11 @@ void init_triton_tlx_ir(py::module &&m) {
              // emitClusterBarrier(needLocal=true): a local (LDS-fenced) barrier
              // bracketed by SchedBarrier(0) guards so the instruction scheduler
              // cannot hoist ops across the ping-pong cluster border.
-             self.create<ROCDL::SchedBarrier>(0);
+             self.create<ROCDL::SchedBarrier>(
+                 ROCDL::SchedGroupMask::none);
              self.create<ttg::BarrierOp>(ttg::AddrSpace::Local);
-             self.create<ROCDL::SchedBarrier>(0);
+             self.create<ROCDL::SchedBarrier>(
+                 ROCDL::SchedGroupMask::none);
            })           
       .def("create_cvt_rs",
            [](TritonOpBuilder &self, Value &src, Type &dstType,

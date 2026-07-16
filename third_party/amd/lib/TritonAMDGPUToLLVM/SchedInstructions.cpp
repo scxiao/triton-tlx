@@ -31,10 +31,8 @@ namespace {
 // Insert intrinsic that controls the types of instructions that may be
 // allowed to cross the intrinsic during instruction scheduling.
 Operation *createSchedBarrier(PatternRewriter &rewriter, Location loc,
-                              mlir::amdgpu::sched_barrier_opt_enum maskValue) {
-  IntegerAttr mask =
-      rewriter.getI32IntegerAttr(static_cast<int32_t>(maskValue));
-  return ROCDL::SchedBarrier::create(rewriter, loc, mask);
+                              ROCDL::SchedGroupMask maskValue) {
+  return ROCDL::SchedBarrier::create(rewriter, loc, maskValue);
 }
 
 // Insert an experimental intrinsic for instruction group level parallelism.
@@ -73,7 +71,7 @@ struct InstructionSchedHintsRewriter
     if (limitSchedulingRange) {
       rewriter.setInsertionPointToStart(block);
       createSchedBarrier(rewriter, loc,
-                         mlir::amdgpu::sched_barrier_opt_enum::none);
+                         ROCDL::SchedGroupMask::none);
     }
 
     rewriter.setInsertionPoint(block, std::prev(block->end()));
@@ -89,7 +87,7 @@ struct InstructionSchedHintsRewriter
 
     if (limitSchedulingRange)
       createSchedBarrier(rewriter, loc,
-                         mlir::amdgpu::sched_barrier_opt_enum::none);
+                         ROCDL::SchedGroupMask::none);
 
     rewriter.eraseOp(instructionSchedHint);
     return success();

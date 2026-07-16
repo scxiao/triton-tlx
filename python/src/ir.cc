@@ -2046,7 +2046,8 @@ void init_triton_ir(py::module &&m) {
       // Warp pipeline border marker (AMD)
       .def("create_warp_pipeline_border",
            [](TritonOpBuilder &self, const std::string &marker, int priority) {
-             auto border = self.create<ROCDL::SchedBarrier>(0);
+             auto border = self.create<ROCDL::SchedBarrier>(
+                 ROCDL::SchedGroupMask::none);
              auto ctx = self.getContext();
              border->setAttr("triton.warp_pipeline.border",
                              StringAttr::get(ctx, marker));
