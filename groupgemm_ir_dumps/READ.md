@@ -94,3 +94,34 @@ each section contains 2048 rows, so all corrupted data are in the last 4096 rows
 
 Seems like something wrong with regard to the offset calculation when `tl.int64` is used.
 
+4. A lot of other changes that are supposed not to change the output behavior make an impact. For example
+ - BLOCK_SIZE_M=256 -> 128
+ - BLOCK_SIZE_N=256 -> 12
+ - NUM_STAGES=2->1
+ - num_warps=8->4
+
+Tried the fix in the issue https://github.com/AMD-Triton/triton-tickets/issues/1350#issuecomment-4468473379, and include the mi350, the error outputs are still there, so it seems like
+the problem is not related to issue: https://github.com/AMD-Triton/triton-tickets/issues/1350.
+
+
+Jul 15 2026
+
+1. Removing the second set of dot op does not help
+```
+        _workgroup_barrier()
+        b_cur = tlx.local_load(tlx.local_view(buffers_B, oe), token=None)
+        at_cur = tlx.local_load(tlx.local_view(buffers_A_top, oe), token=None)
+        ab_cur = tlx.local_load(tlx.local_view(buffers_A_bot, oe), token=None)
+        acc_top = tl.dot(at_cur, b_cur, acc_top)
+        acc_bot = tl.dot(ab_cur, b_cur, acc_bot)
+```
+
+2. Switch the call of the two tl.store(), the problem is also gone
+
+3. remove the mask of the `tl.store()` can also make the issue gone
+
+
+Jul 16 2026
+1. Disable the llvm optimization, problem is gone
+`DISABLE_LLVM_OPT=1 python glocal_full.py`
+

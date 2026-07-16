@@ -185,9 +185,9 @@ def _amd_grouped_gemm_fprop_kernel(
         _workgroup_barrier()
 
         tl.store(y_ptr + row_t[:, None] * stride_ym + offs_n[None, :] * stride_yn,
-                    yt, mask=smask_mt & mask_n_col)
+                    yt, mask=smask_mb & mask_n_col)
         tl.store(y_ptr + row_b[:, None] * stride_ym + offs_n[None, :] * stride_yn,
-                    yb, mask=smask_mb & mask_n_col)
+                    yb, mask=smask_mt & mask_n_col)
 
         # Compute the tile base pointer as a scalar (i64) so the compiler can keep it
         # in an SGPR pair, leaving only the within-tile (i32) offset in VGPRs.  This
@@ -216,9 +216,7 @@ def _amd_grouped_gemm_fprop_kernel(
         # tl.store(y_ptr_tile + row_wb[:, None] * stride_ym + col_w[None, :] * stride_yn,
         #          yb, mask=smask_mb & mask_n_col)
 
-
         tile_idx += NUM_CUS
-        _workgroup_barrier()
 
 
 def amd_grouped_gemm_fprop(x, w, *, y=None, num_cus=None):
@@ -235,6 +233,7 @@ def amd_grouped_gemm_fprop(x, w, *, y=None, num_cus=None):
             y.zero_()  # so the "written" dump shows only live stores, not garbage
     if num_cus is None:
         num_cus = _num_cus()
+    num_cus = triton.cdiv(GM, 256) * triton.cdiv(N, 256)
     _amd_grouped_gemm_fprop_kernel[(num_cus,)](
         x, w, y, GM, N, K,
         x.stride(0), x.stride(1), w.stride(1), w.stride(2),
