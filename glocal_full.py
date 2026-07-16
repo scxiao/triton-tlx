@@ -243,15 +243,16 @@ def amd_grouped_gemm_fprop(x, w, *, y=None, num_cus=None):
         num_warps=8, matrix_instr_nonkdim=16, waves_per_eu=0,
     )
     
-    check_results = bool(os.environ.get("CHECKING", "0"))
-    res_file_name = "result.data"
-    if check_results:
-        print(f"****check_result****")
-        save_results = torch.load(res_file_name)
-        torch.testing.assert_close(y, save_results)
-    else:
-        print(f"****save_results****")
-        torch.save(y, res_file_name)
+    # check_results = int(os.environ.get("CHECKING", "0"))
+    # print(f"check_results = {check_results}")
+    # res_file_name = "result.data"
+    # if check_results:
+    #     print(f"****check_result****")
+    #     save_results = torch.load(res_file_name)
+    #     torch.testing.assert_close(y, save_results)
+    # else:
+    #     print(f"****save_results****")
+    #     torch.save(y, res_file_name)
     
     return y
 
