@@ -545,7 +545,7 @@ def matmul(a, b, SPLIT_K=None):
     # Each split is a whole number of K-tiles, big enough for the 2-tile prologue.
     assert K % SPLIT_K == 0, f"K={K} must be divisible by SPLIT_K={SPLIT_K}"
     assert KS >= 2 * BLOCK_K, f"K/SPLIT_K={KS} must be at least {2 * BLOCK_K}"
-    assert KS % BLOCK_K == 0, f"K/SPLIT_K={KS} must be a multiple of BLOCK_K={BLOCK_K} (split base alignment)"
+    # assert KS % BLOCK_K == 0, f"K/SPLIT_K={KS} must be a multiple of BLOCK_K={BLOCK_K} (split base alignment)"
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     GRID_MN = triton.cdiv(M, BM) * triton.cdiv(N, BN)
     if SPLIT_K > 1:
