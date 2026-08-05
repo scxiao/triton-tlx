@@ -44,6 +44,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.testing import do_bench
+import pytest
 
 BLOCK_N = 256
 BLOCK_K = 32
@@ -135,10 +136,10 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in tl.range(0, KI - NB):
         cur = (k + 1) % NB; pf = k % NB; kp = (k + NB) * BK
-        acc = tl.dot(a, b, acc)
         km = (kp + ok) < K
         ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
         br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        acc = tl.dot(a, b, acc)
         tlx.local_store(tlx.local_view(sA, pf), ar); tlx.local_store(tlx.local_view(sB, pf), br)
         tl.debug_barrier()
         a = tlx.local_load(tlx.local_view(sA, cur)); b = tlx.local_load(tlx.local_view(sB, cur))
@@ -201,12 +202,33 @@ def _warm_ms(fn, iters=60, warmup=20):
     torch.cuda.synchronize()
     return s.elapsed_time(e) / iters
 
+@pytest.mark.parametrize("B, M, N, K",
+    [
+        (320, 1024, 256, 256),
+        (1024, 395, 256, 320),
+        (1024, 40, 256, 1956),
+        (1024, 262, 256, 294),
+        (1024, 1195, 256, 2309)
+    ]
+)
+def test_correctness(B, M, N, K):
+    dev = triton.runtime.driver.active.get_active_torch_device()
+    a, b = make_bmm_inputs(B, M, N, K, dev)
+    ref = torch.bmm(a, b)
+    out = bmm(a, b)
+    ok = torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
 
 if __name__ == "__main__":
     dev = triton.runtime.driver.active.get_active_torch_device()
     # (B, M, N, K): representative shared-LHS shapes.  Always shared-A.
-    shapes = [(320, 1024, 256, 256), (1024, 395, 256, 320), (1024, 40, 256, 1956), (1024, 262, 256, 294),
-              (1024, 1195, 256, 2309)]
+    shapes = [
+        (320, 1024, 256, 256),
+        (1024, 395, 256, 320),
+        (1024, 40, 256, 1956),
+        (1024, 262, 256, 294),
+        (1024, 1195, 256, 2309)
+        ]
     print("mode: shared-A (shared-LHS)   (B row-major)")
     print(f"{'M x N x K (B)':<22}{'path':<8}{'TLX':>9}{'rocBLAS':>10}{'ratio':>8}  {'ok'}")
     for B, M, N, K in shapes:
