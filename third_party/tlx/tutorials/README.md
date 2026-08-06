@@ -10,14 +10,6 @@
   1195x256x2309 (1024)  reg     2181u    1705u    0.78x  OK
 ```
 
-/workspace/projects/triton-tlx/python/triton/runtime/jit.py:525: UserWarning: [Triton] TRITON_ENABLE_C_CACHE: C fast path bypassed for kernel '__main__._bmm_direct': unknown reason
-  return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
-1024x256x256 (320)    direct        88u       76u   0.87x  OK
-395x256x320 (1024)    direct       146u      122u   0.83x  OK
-40x256x1956 (1024)    reg          193u      183u   0.95x  OK
-262x256x294 (1024)    reg          125u       82u   0.66x  OK
-1195x256x2309 (1024)  reg         2195u     1717u   0.78x  OK
-
 The hipblasLT kernels called for each input shape
 ```
   ┌──────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐ 
@@ -54,3 +46,51 @@ The hipblasLT kernels called for each input shape
   │                      │ WG64_4_1                                                                                                                 │ 
   └──────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘ 
 ```
+
+- Collected the att trace of hipblast and triton kernel `_bmm_register` and hipblasLT for two shapes `1024×262×256×294`, here are the difference:
+```
+┌──────────────────────┬─────────────┬─────────────┐
+│      Parameter       │   Triton    │  hipBLASLt  │
+├──────────────────────┼─────────────┼─────────────┤
+│ BLOCK_M              │ 128         │ 32          │
+├──────────────────────┼─────────────┼─────────────┤
+│ BLOCK_N              │ 256         │ 256         │
+├──────────────────────┼─────────────┼─────────────┤
+│ BLOCK_K              │ 32          │ 32          │
+├──────────────────────┼─────────────┼─────────────┤
+│                      │             │             │
+├──────────────────────┼─────────────┼─────────────┤
+│ tile_size_A          │ 4096        │ 4608        │
+├──────────────────────┼─────────────┼─────────────┤
+│ tile_size_B          │ 8192        │ 8192        │
+├──────────────────────┼─────────────┼─────────────┤
+│ num_warps            │ 8           │ 4           │
+├──────────────────────┼─────────────┼─────────────┤
+│                      │             │             │
+├──────────────────────┼─────────────┼─────────────┤
+│ A load instruction   │ buf_ushort  │ buf_dword   │
+├──────────────────────┼─────────────┼─────────────┤
+│ A load instruction # │ 8           │ 9           │
+├──────────────────────┼─────────────┼─────────────┤
+│ B load instruction   │ buf_dwordx4 │ buf_dwordx4 │
+├──────────────────────┼─────────────┼─────────────┤
+│ B load instruction # │ 2           │ 4           │
+├──────────────────────┼─────────────┼─────────────┤
+│                      │             │             │
+├──────────────────────┼─────────────┼─────────────┤
+│ matrix_instr_nonkdim │ 32          │ 16          │
+├──────────────────────┼─────────────┼─────────────┤
+│ # MFMA instructions  │ 8           │ 36          │
+├──────────────────────┼─────────────┼─────────────┤
+│                      │             │             │
+├──────────────────────┼─────────────┼─────────────┤
+│ # workgroups         │ 3072        │ 2048        │
+├──────────────────────┼─────────────┼─────────────┤
+│ total shape (M×N×K)  │ 384×256×32  │ 288×256×32  │
+└──────────────────────┴─────────────┴─────────────┘
+  ```
+Some findings:
+- Loading of A in Triton uses `buffer_load_ushort`, but it uses `buffer_load_dword` in hipblasLT
+- hipBlasLT can use tile size `BLOCK_M=144` (not power of 2). Compared to the triton configuration, it does `34%` (`384/288 - 1 = 0.34`) less computation.
+
+Optimization:
