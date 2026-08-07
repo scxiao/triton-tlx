@@ -95,8 +95,9 @@ Some findings:
 - hipBlasLT can use tile size `BLOCK_M=144` (not power of 2). Compared to the triton configuration, it does `34%` (`384/288 - 1 = 0.34`) less computation.
 
 To do:
-- Check if there is way to use `buffer_load_dword` to load A, this can reduce the overhead of loading A 
-from global memory to VGPR and then write to LDS
-- 
+- Check if there is way to use `buffer_load_dword` to load A, this can reduce the overhead of loading A from global memory to VGPR and then write to LDS
+- Since A matrix is shared along the batch dim, we can share the A tile among a
+fixed number of b matrix. (This can reduce the overhead of loading A and this is 
+where the buffer_load_ushort is used)
 
 For the shape `1024×1195×256×2309`, triton uses the config `(BM, BN, BK) = (128, 256, 32)`, hipblasLT use the config: `(BM, BN, BK) = (240, 256, 32)`
