@@ -101,3 +101,22 @@ fixed number of b matrix. (This can reduce the overhead of loading A and this is
 where the buffer_load_ushort is used)
 
 For the shape `1024×1195×256×2309`, triton uses the config `(BM, BN, BK) = (128, 256, 32)`, hipblasLT use the config: `(BM, BN, BK) = (240, 256, 32)`
+
+- Implemented each A tile is used by 2 B matrix, but perf is not good for the initial implementation, need further investigation
+```
+M x N x K (B)         path          TLX   rocBLAS   ratio  ok
+1024x256x256 (320)    direct        86u       76u   0.88x  OK
+395x256x320 (1024)    direct       153u      123u   0.80x  OK
+40x256x1956 (1024)    reg          229u      182u   0.80x  OK
+262x256x294 (1024)    reg          155u       85u   0.55x  OK
+1195x256x2309 (1024)  reg         2338u     1713u   0.73x  OK
+```
+baseline perf as ref:
+```
+M x N x K (B)         path     TLX    rocBLAS   ratio
+  1024x256x256 (320)    direct    88u      76u    0.86x  OK
+  395x256x320 (1024)    direct   146u     121u    0.83x  OK
+  40x256x1956 (1024)    reg      192u     182u    0.95x  OK
+  262x256x294 (1024)    reg      124u      81u    0.65x  OK
+  1195x256x2309 (1024)  reg     2181u    1705u    0.78x  OK
+```
