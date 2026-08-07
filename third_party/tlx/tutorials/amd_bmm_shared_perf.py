@@ -191,7 +191,7 @@ def _bmm_register_multiB(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, 
         # br2 = tl.load(b_ptrs2 + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
         # br3 = tl.load(b_ptrs3 + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
         tlx.local_store(tlx.local_view(sB, i * NUM_B_MATRIX + 0), br0)
-        tlx.local_store(tlx.local_view(sB, 1 * NUM_B_MATRIX + 1), br1)
+        tlx.local_store(tlx.local_view(sB, i * NUM_B_MATRIX + 1), br1)
         # tlx.local_store(tlx.local_view(sB, 2), br2)
         # tlx.local_store(tlx.local_view(sB, 3), br3)
     tl.debug_barrier()
