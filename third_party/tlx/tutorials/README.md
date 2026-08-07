@@ -52,7 +52,7 @@ The hipblasLT kernels called for each input shape
 ┌──────────────────────┬─────────────┬─────────────┐
 │      Parameter       │   Triton    │  hipBLASLt  │
 ├──────────────────────┼─────────────┼─────────────┤
-│ BLOCK_M              │ 128         │ 32          │
+│ BLOCK_M              │ 128         │ 144         │
 ├──────────────────────┼─────────────┼─────────────┤
 │ BLOCK_N              │ 256         │ 256         │
 ├──────────────────────┼─────────────┼─────────────┤
@@ -91,6 +91,12 @@ The hipblasLT kernels called for each input shape
   ```
 Some findings:
 - Loading of A in Triton uses `buffer_load_ushort`, but it uses `buffer_load_dword` in hipblasLT
+- mfma shape, Triton uses mfma32, hipblaslt uses mfma16
 - hipBlasLT can use tile size `BLOCK_M=144` (not power of 2). Compared to the triton configuration, it does `34%` (`384/288 - 1 = 0.34`) less computation.
 
-Optimization:
+To do:
+- Check if there is way to use `buffer_load_dword` to load A, this can reduce the overhead of loading A 
+from global memory to VGPR and then write to LDS
+- 
+
+For the shape `1024×1195×256×2309`, triton uses the config `(BM, BN, BK) = (128, 256, 32)`, hipblasLT use the config: `(BM, BN, BK) = (240, 256, 32)`

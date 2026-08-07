@@ -128,21 +128,24 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     ao = om[:, None] * sam; bo = on[None, :] * sbn; KI = tl.cdiv(K, BK)
     for i in tl.range(0, NB, loop_unroll_factor=NB):
         kk = i * BK; km = (kk + ok) < K
-        ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak, mask=km[None, :], other=0.0)
         br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
-        tlx.local_store(tlx.local_view(sA, i), ar); tlx.local_store(tlx.local_view(sB, i), br)
+        ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak, mask=km[None, :], other=0.0)
+        tlx.local_store(tlx.local_view(sA, i), ar)
+        tlx.local_store(tlx.local_view(sB, i), br)
     tl.debug_barrier()
     a = tlx.local_load(tlx.local_view(sA, 0)); b = tlx.local_load(tlx.local_view(sB, 0))
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in tl.range(0, KI - NB):
         cur = (k + 1) % NB; pf = k % NB; kp = (k + NB) * BK
         km = (kp + ok) < K
-        ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
         br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
         acc = tl.dot(a, b, acc)
-        tlx.local_store(tlx.local_view(sA, pf), ar); tlx.local_store(tlx.local_view(sB, pf), br)
+        tlx.local_store(tlx.local_view(sA, pf), ar)
+        tlx.local_store(tlx.local_view(sB, pf), br)
         tl.debug_barrier()
-        a = tlx.local_load(tlx.local_view(sA, cur)); b = tlx.local_load(tlx.local_view(sB, cur))
+        a = tlx.local_load(tlx.local_view(sA, cur))
+        b = tlx.local_load(tlx.local_view(sB, cur))
     acc = tl.dot(a, b, acc)
     for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
         bf = (KI - (NB - 1) + i) % NB
