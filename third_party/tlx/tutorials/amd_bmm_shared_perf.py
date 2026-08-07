@@ -155,12 +155,123 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     tl.store(cb + scm * rm[:, None] + scn * rn[None, :], acc.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
+# since A matrix is shared across batches, so we can load 1 A to process multiple B matrix
+@triton.jit
+def _bmm_register_multiB(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
+                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                  NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr, NUM_B_MATRIX: tl.constexpr):
+    """Odd / unaligned K: register path (tl.load -> local_store), masked K-tail."""
+    npn = tl.cdiv(N, BN)
+    pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
+    bid = pidf // GMN; pid = pidf % GMN; pm = pid // npn; pn = pid % npn
+    sA = tlx.local_alloc((BM, BK), tl.float16, NB)
+    # allocate lds for each B, total NB * NUM_B_MATRIX buffers
+    sB = tlx.local_alloc((BK, BN), tl.float16, NB * NUM_B_MATRIX)
+    
+    om = (pm * BM + tl.arange(0, BM)) % M
+    on = (pn * BN + tl.arange(0, BN)) % N
+    ok = tl.arange(0, BK)
+    a_ptrs = a_ptr + bid.to(tl.int64) * sab
+    b_ptrs0 = b_ptr + (bid * NUM_B_MATRIX + 0).to(tl.int64) * sbb
+    b_ptrs1 = b_ptr + (bid * NUM_B_MATRIX + 1).to(tl.int64) * sbb
+    # b_ptrs2 = b_ptr + (bid * NUM_B_MATRIX + 2).to(tl.int64) * sbb
+    # b_ptrs3 = b_ptr + (bid * NUM_B_MATRIX + 3).to(tl.int64) * sbb
+    ao = om[:, None] * sam
+    bo = on[None, :] * sbn
+    KI = tl.cdiv(K, BK)
+    
+    for i in tl.range(0, NB, loop_unroll_factor=NB):
+        kk = i * BK
+        km = (kk + ok) < K
+        ar = tl.load(a_ptrs + ao + (kk + ok[None, :]) * sak, mask=km[None, :], other=0.0)
+        tlx.local_store(tlx.local_view(sA, i), ar)
+        
+        br0 = tl.load(b_ptrs0 + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        br1 = tl.load(b_ptrs1 + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        # br2 = tl.load(b_ptrs2 + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        # br3 = tl.load(b_ptrs3 + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        tlx.local_store(tlx.local_view(sB, i * NUM_B_MATRIX + 0), br0)
+        tlx.local_store(tlx.local_view(sB, 1 * NUM_B_MATRIX + 1), br1)
+        # tlx.local_store(tlx.local_view(sB, 2), br2)
+        # tlx.local_store(tlx.local_view(sB, 3), br3)
+    tl.debug_barrier()
+
+    a = tlx.local_load(tlx.local_view(sA, 0))
+    b0 = tlx.local_load(tlx.local_view(sB, 0))
+    b1 = tlx.local_load(tlx.local_view(sB, 1))
+    # b2 = tlx.local_load(tlx.local_view(sB, 2))
+    # b3 = tlx.local_load(tlx.local_view(sB, 3))
+    
+    acc0 = tl.zeros((BM, BN), dtype=tl.float32)
+    acc1 = tl.zeros((BM, BN), dtype=tl.float32)
+    # acc2 = tl.zeros((BM, BN), dtype=tl.float32)
+    # acc3 = tl.zeros((BM, BN), dtype=tl.float32)
+    
+    for k in tl.range(0, KI - NB):
+        cur = (k + 1) % NB
+        pf = k % NB
+        kp = (k + NB) * BK
+        km = (kp + ok) < K
+        br0 = tl.load(b_ptrs0 + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        br1 = tl.load(b_ptrs1 + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        # br2 = tl.load(b_ptrs2 + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        # br3 = tl.load(b_ptrs3 + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
+        ar = tl.load(a_ptrs + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
+
+        acc0 = tl.dot(a, b0, acc0)
+        acc1 = tl.dot(a, b1, acc1)
+        # acc2 = tl.dot(a, b2, acc2)
+        # acc3 = tl.dot(a, b3, acc3)
+        
+        tlx.local_store(tlx.local_view(sA, pf), ar)
+        tlx.local_store(tlx.local_view(sB, pf * NUM_B_MATRIX + 0), br0)
+        tlx.local_store(tlx.local_view(sB, pf * NUM_B_MATRIX + 1), br1)
+        # tlx.local_store(tlx.local_view(sB, pf * NUM_B_MATRIX + 2), br2)
+        # tlx.local_store(tlx.local_view(sB, pf * NUM_B_MATRIX + 3), br3)
+        
+        tl.debug_barrier()
+        a = tlx.local_load(tlx.local_view(sA, cur))
+        b0 = tlx.local_load(tlx.local_view(sB, cur * NUM_B_MATRIX + 0))
+        b1 = tlx.local_load(tlx.local_view(sB, cur * NUM_B_MATRIX + 1))
+        # b2 = tlx.local_load(tlx.local_view(sB, cur * NUM_B_MATRIX + 2))
+        # b3 = tlx.local_load(tlx.local_view(sB, cur * NUM_B_MATRIX + 3))
+        
+    acc0 = tl.dot(a, b0, acc0)
+    acc1 = tl.dot(a, b1, acc1)
+    # acc2 = tl.dot(a, b2, acc2)
+    # acc3 = tl.dot(a, b3, acc3)
+    for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
+        bf = (KI - (NB - 1) + i) % NB
+        a = tlx.local_load(tlx.local_view(sA, bf))
+        b0 = tlx.local_load(tlx.local_view(sB, bf * NUM_B_MATRIX + 0))
+        b1 = tlx.local_load(tlx.local_view(sB, bf * NUM_B_MATRIX + 1))
+        # b2 = tlx.local_load(tlx.local_view(sB, bf * NUM_B_MATRIX + 2))
+        # b3 = tlx.local_load(tlx.local_view(sB, bf * NUM_B_MATRIX + 3))
+        acc0 = tl.dot(a, b0, acc0)
+        acc1 = tl.dot(a, b1, acc1)
+        # acc2 = tl.dot(a, b0, acc2)
+        # acc3 = tl.dot(a, b0, acc3)
+        
+    et = c_ptr.dtype.element_ty 
+    cb0 = c_ptr + (bid * NUM_B_MATRIX + 0).to(tl.int64) * scb
+    cb1 = c_ptr + (bid * NUM_B_MATRIX + 1).to(tl.int64) * scb
+    # cb2 = c_ptr + (bid * NUM_B_MATRIX + 2).to(tl.int64) * scb
+    # cb3 = c_ptr + (bid * NUM_B_MATRIX + 3).to(tl.int64) * scb
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    tl.store(cb0 + scm * rm[:, None] + scn * rn[None, :], acc0.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
+    tl.store(cb1 + scm * rm[:, None] + scn * rn[None, :], acc1.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
+    # tl.store(cb2 + scm * rm[:, None] + scn * rn[None, :], acc2.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
+    # tl.store(cb3 + scm * rm[:, None] + scn * rn[None, :], acc3.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
 def bmm(a, b):
     """C = A @ B, shared-A, ROW-major B (stride_bn == 1). nw=8, mfma=32."""
     Bs, M, K = a.shape
     N = b.shape[-1]
     bm = 64 if M <= 64 else 128
     nb = min(NB, triton.cdiv(K, BLOCK_K))
+    # nb = 2
     GMN = triton.cdiv(M, bm) * triton.cdiv(N, BLOCK_N)
     NT = Bs * GMN
     c = torch.empty((Bs, M, N), device=a.device, dtype=a.dtype)
@@ -174,8 +285,14 @@ def bmm(a, b):
         _bmm_direct[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, AB=AB, BB=BB, NUM_XCDS=NUM_XCDS,
                             GMN=GMN, NT=NT, NB=nb, **common)
     else:  # odd / unaligned K -> register path
-        _bmm_register[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT,
-                              NB=nb, **common)
+        # _bmm_register[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT,
+        #                       NB=nb, **common)
+
+        # each tile process 4 B matrices
+        num_b_matrices = 2
+        NT = Bs * GMN // num_b_matrices
+        _bmm_register_multiB[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT,
+                              NB=nb, NUM_B_MATRIX=num_b_matrices, **common)
     return c
 
 
