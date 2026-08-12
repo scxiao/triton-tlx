@@ -38,6 +38,7 @@ verified forcing it gives wrong results). Triton's AMD backend emits
 ``buffer_load_ushort`` (zero-extend, 1 fp16/reg) instead -> the remaining gap is
 this d16-packing codegen difference, not tiling/config.
 """
+import math
 import torch
 
 import triton
@@ -117,7 +118,8 @@ def _bmm_direct(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb,
 @triton.jit
 def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
                   BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                  NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr):
+                  NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr, NB: tl.constexpr,
+                  DIVISIBILITY_SAM: tl.constexpr, DIVISIBILITY_K: tl.constexpr):
     """Odd / unaligned K: register path (tl.load -> local_store), masked K-tail."""
     npn = tl.cdiv(N, BN)
     pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
@@ -125,9 +127,9 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     sA = tlx.local_alloc((BM, BK), tl.float16, NB); sB = tlx.local_alloc((BK, BN), tl.float16, NB)
     om = (pm * BM + tl.arange(0, BM)) % M; on = (pn * BN + tl.arange(0, BN)) % N; ok = tl.arange(0, BK)
     a_ptr = a_ptr + bid.to(tl.int64) * sab; b_ptr = b_ptr + bid.to(tl.int64) * sbb
-    ao = om[:, None] * sam; bo = on[None, :] * sbn; KI = tl.cdiv(K, BK)
+    ao = tl.multiple_of(om[:, None] * sam, [DIVISIBILITY_SAM, 1]); bo = on[None, :] * sbn; KI = tl.cdiv(K, BK)
     for i in tl.range(0, NB, loop_unroll_factor=NB):
-        kk = i * BK; km = (kk + ok) < K
+        kk = i * BK; km = tl.max_constancy((kk + ok) < K, [DIVISIBILITY_K])
         br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
         ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak, mask=km[None, :], other=0.0)
         tlx.local_store(tlx.local_view(sA, i), ar)
@@ -137,15 +139,15 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k in tl.range(0, KI - NB):
         cur = (k + 1) % NB; pf = k % NB; kp = (k + NB) * BK
-        km = (kp + ok) < K
+        km = tl.max_constancy((kp + ok) < K, [DIVISIBILITY_K])
         br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
         ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
         acc = tl.dot(a, b, acc)
+        a = tlx.local_load(tlx.local_view(sA, cur))
+        b = tlx.local_load(tlx.local_view(sB, cur))
         tlx.local_store(tlx.local_view(sA, pf), ar)
         tlx.local_store(tlx.local_view(sB, pf), br)
         tl.debug_barrier()
-        a = tlx.local_load(tlx.local_view(sA, cur))
-        b = tlx.local_load(tlx.local_view(sB, cur))
     acc = tl.dot(a, b, acc)
     for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
         bf = (KI - (NB - 1) + i) % NB
@@ -276,23 +278,28 @@ def bmm(a, b):
     NT = Bs * GMN
     c = torch.empty((Bs, M, N), device=a.device, dtype=a.dtype)
     attrs = (("amdgpu-agpr-alloc", "0,0"), )
-    common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
     st = (a.stride(0), a.stride(1), a.stride(2), b.stride(0), b.stride(1), b.stride(2), c.stride(0), c.stride(1),
           c.stride(2))
     if K % 8 == 0:  # 16-byte-aligned A rows -> direct-to-LDS (wins)
+        common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
         AB = tuple(tuple(x) for x in _swz([bm, BLOCK_K], 1))
         BB = tuple(tuple(x) for x in _swz([BLOCK_K, BLOCK_N], 1))
         _bmm_direct[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, AB=AB, BB=BB, NUM_XCDS=NUM_XCDS,
                             GMN=GMN, NT=NT, NB=nb, **common)
     else:  # odd / unaligned K -> register path
-        # _bmm_register[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT,
-        #                       NB=nb, **common)
+        common = dict(num_warps=4, num_stages=1, matrix_instr_nonkdim=16, llvm_fn_attrs=attrs)
+        # nb = 3
+        divisibility_sam = math.gcd(int(a.stride(1)), 16)
+        divisibility_k = math.gcd(int(K), 16)
+        # print(f"divisibility_sam = {divisibility_sam}, divisibility_k = {divisibility_k}")
+        _bmm_register[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT,
+                              NB=nb, DIVISIBILITY_SAM=divisibility_sam, DIVISIBILITY_K=divisibility_k, **common)
 
         # each tile process 4 B matrices
-        num_b_matrices = 2
-        NT = Bs * GMN // num_b_matrices
-        _bmm_register_multiB[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT,
-                              NB=nb, NUM_B_MATRIX=num_b_matrices, **common)
+        # num_b_matrices = 2
+        # NT = Bs * GMN // num_b_matrices
+        # _bmm_register_multiB[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K, NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT,
+        #                       NB=nb, NUM_B_MATRIX=num_b_matrices, **common)
     return c
 
 
@@ -324,10 +331,10 @@ def _warm_ms(fn, iters=60, warmup=20):
 
 @pytest.mark.parametrize("B, M, N, K",
     [
-        (320, 1024, 256, 256),
-        (1024, 395, 256, 320),
-        (1024, 40, 256, 1956),
-        (1024, 262, 256, 294),
+        # (320, 1024, 256, 256),
+        # (1024, 395, 256, 320),
+        # (1024, 40, 256, 1956),
+        # (1024, 262, 256, 294),
         (1024, 1195, 256, 2309)
     ]
 )

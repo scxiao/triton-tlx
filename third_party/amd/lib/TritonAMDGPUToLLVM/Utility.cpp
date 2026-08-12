@@ -684,20 +684,20 @@ unsigned getContiguity(Value ptr, Value offset,
   Type type = getPointerTypeWithShape(ptr, offset);
   RankedTensorType tensorTy = cast<RankedTensorType>(type);
 
-  // To compute the contiguity of the scalar/warp-uniform ptr and offset pair we
-  // need to look at the contiguity of the offsets and the alignment of the ptr
-  auto elemNumBits = triton::getPointeeBitWidth(tensorTy);
-  auto contiguity = axisAnalysisPass.getContiguity(offset, elemNumBits);
-
   // To get the alignment of the scalar ptr we need to look at the divisibility
+  auto elemNumBits = triton::getPointeeBitWidth(tensorTy);
   auto *axisInfo = axisAnalysisPass.getAxisInfo(ptr);
   auto maxMultipleBytes = axisInfo->getDivisibility(0);
   auto elemNumBytes = std::max<unsigned>(elemNumBits / 8, 1);
   auto align = std::max<unsigned>(maxMultipleBytes / elemNumBytes, 1);
 
-  // FIXME (Alex): this should not be needed anymore because it's done inside
-  // getContiguity, but we have an order issues with LL, so we keep this
-  // until the LL order issue is fixed
+  // The layout's contigPerThread is the primary contiguity bound. The offset
+  // divisibility is NOT used here: for buffer loads, the offset along the fast
+  // axis is a contiguous range (e.g. row_base + arange(N)), whose element-GCD
+  // is always 1, which would incorrectly cap vectorization.  The alignment of
+  // the first element of each group (row_base) is already captured by the
+  // coalesce pass via the layout's sizePerThread, so contigPerThread is the
+  // right bound.
   auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
   auto llAttr = triton::gpu::LinearEncodingAttr::get(tensorTy.getContext(),
                                                      std::move(linearLayout));
@@ -705,9 +705,9 @@ unsigned getContiguity(Value ptr, Value offset,
   auto contigPerThread = llAttr.getContigPerThread();
   assert(order[0] < contigPerThread.size() &&
          "Unexpected contigPerThread size");
-  contiguity = std::min(contiguity, contigPerThread[order[0]]);
+  unsigned contiguity = contigPerThread[order[0]];
 
-  // Final contiguity is a min of the offset contiguity and pointer alignment
+  // Final contiguity is a min of the layout contiguity and pointer alignment
   return std::min(align, contiguity);
 }
 
