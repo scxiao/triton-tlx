@@ -111,12 +111,48 @@ M x N x K (B)         path          TLX   rocBLAS   ratio  ok
 262x256x294 (1024)    reg          155u       85u   0.55x  OK
 1195x256x2309 (1024)  reg         2338u     1713u   0.73x  OK
 ```
-baseline perf as ref:
+
+# Aug 12 2026
+- Changed the kernel to add explicit indication of divisibility of A matrix and K value, 
+- Remove the masks from the async_load,
+got the following perf numbers:
 ```
-M x N x K (B)         path     TLX    rocBLAS   ratio
-  1024x256x256 (320)    direct    88u      76u    0.86x  OK
-  395x256x320 (1024)    direct   146u     121u    0.83x  OK
-  40x256x1956 (1024)    reg      192u     182u    0.95x  OK
-  262x256x294 (1024)    reg      124u      81u    0.65x  OK
-  1195x256x2309 (1024)  reg     2181u    1705u    0.78x  OK
+M x N x K (B)         path          TLX   rocBLAS   ratio  ok
+1024x256x256 (320)    direct        87u       75u   0.86x  OK
+395x256x320 (1024)    direct       144u      122u   0.85x  OK
+40x256x1956 (1024)    reg          172u      175u   1.01x  OK
+262x256x294 (1024)    reg          113u       83u   0.74x  OK
+1195x256x2309 (1024)  reg         2064u     1717u   0.83x  OK
 ```
+
+# Aug 13 2026
+Implemented shared-A multiB optimization (one CTA processes NUM_B_MATRIX=2 consecutive
+B matrices from a single A load), fixing a critical LDS overflow bug in the previous
+attempt and profiling to characterize the VGPR bottleneck.
+
+Key findings:
+- **LDS overflow root cause**: original `_bmm_register_multiB` with NB=3, NUM_B_MATRIX=2,
+  BM=128 used 120KB LDS (exceeds 96KB CDNA4 limit) → kernel silently ran OOB. Fix: NB_MULTI=2
+  (LDS: 80KB for BM=128).
+- **VGPR spill root cause**: at num_warps=4, two (128,256)fp32 accumulators cause 643 VGPR
+  spills (ScratchSize=920B) → 8x slowdown. At num_warps=8: 232 VGPRs, 0 spills.
+- **MultiB only helps for M≤64**: halving NT (CTA count) hurts GPU occupancy for large-M
+  shapes (M=262, M=1195) where NT is already high. For M=40 (NT=512→256), multiB is neutral
+  to slightly positive.
+- **Direct path nw=8 is a net win**: switching from nw=8 (already correct) confirms the
+  direct path is optimal. A small improvement on 1024x256x256 (0.86→0.87x).
+
+Current perf (multiB enabled for M≤64 reg path, single-B nw=8 for direct path):
+```
+M x N x K (B)         path          TLX   rocBLAS   ratio  ok
+1024x256x256 (320)    direct        86u       75u   0.87x  OK
+395x256x320 (1024)    direct       143u      121u   0.84x  OK
+40x256x1956 (1024)    reg          176u      177u   1.01x  OK
+262x256x294 (1024)    reg          117u       83u   0.74x  OK
+1195x256x2309 (1024)  reg         2040u     1697u   0.83x  OK
+```
+
+Remaining gap for reg-path shapes is the same root cause as before: `buffer_load_ushort`
+(1 fp16/VGPR) vs rocBLAS's d16-packed loads (2 fp16/VGPR) — a codegen limitation, not
+a tiling/pipelining issue.
+
