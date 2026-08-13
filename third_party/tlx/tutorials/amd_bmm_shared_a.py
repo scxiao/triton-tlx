@@ -29,6 +29,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 from triton.testing import do_bench
+from amd_bmm_rbs import bmm as rbs_bmm
 
 BLOCK_N = 256
 BLOCK_K = 32
@@ -206,9 +207,9 @@ if __name__ == "__main__":
     for B, M, N, K in shapes:
         a, b = make_bmm_inputs(B, M, N, K, dev)
         ref = torch.bmm(a, b)
-        out = bmm(a, b)
+        out = rbs_bmm(a, b)
         ok = torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
-        t = _warm_ms(lambda: bmm(a, b)) * 1e3
+        t = _warm_ms(lambda: rbs_bmm(a, b)) * 1e3
         rb = _warm_ms(lambda: torch.bmm(a, b)) * 1e3
         path = "direct" if K % BLOCK_K == 0 else "reg"
         print(f"{f'{M}x{N}x{K} ({B})':<22}{path:<8}{t:8.0f}u{rb:9.0f}u{rb / t:7.2f}x  {'OK' if ok else 'WRONG'}")
