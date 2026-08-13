@@ -24,6 +24,12 @@ add_triton_ut(
   SRCS modulo_schedule_test.cpp
   LIBS
     TritonGPUModuloCore
+    TritonAnalysis
+    TritonGPUIR
+    TritonNvidiaGPUIR
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
+    TLXIR
 )
 
 add_triton_ut(
@@ -31,6 +37,12 @@ add_triton_ut(
   SRCS joint_solver_fallback_test.cpp
   LIBS
     TritonGPUModuloCore
+    TritonAnalysis
+    TritonGPUIR
+    TritonNvidiaGPUIR
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
+    TLXIR
 )
 
 if(TRITON_ENABLE_Z3_JOINT_SOLVER)
