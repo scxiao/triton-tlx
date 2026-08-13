@@ -196,8 +196,7 @@ unsigned getNumElementsPerThread(Operation *op, SmallVector<unsigned> order,
                         << ", divisibility: " << maxMultipleBytes
                         << ", contig: " << valInfo.getContiguity(order[0])
                         << ", maximum: " << maxElementsPerThread
-                        << ", alignment: " << alignment
-                        << ", maxContig: " << maxContig);
+                        << ", alignment: " << alignment);
   return currPerThread;
 }
 

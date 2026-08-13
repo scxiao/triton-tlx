@@ -1,7 +1,6 @@
 """AMD a16w16 batched GEMM (BMM) for gfx950 / CDNA4 — dual load-path, single kernel.
 
 C[b] = A[b] @ B[b], fp16/bf16, batched. A is (B, M, K); B is (B, K, N) COLUMN-major
-<<<<<<< HEAD
 (K-contiguous, ``stride_bk == 1``), i.e. built as (B, N, K) then transposed — the
 layout the direct-to-LDS B loads expect. C is (B, M, N) row-major.
 ``make_bmm_inputs`` builds SHARED-A (one (M, K) reused across the batch,
@@ -35,38 +34,6 @@ Design notes shared by both paths:
   * 4-warp coalesced split-store ([128, 256] -> two [128, 128] dwordx4 stores).
 
 Exposes ``bmm(a, b)``.
-=======
-(K-contiguous, stride_bk == 1), i.e. built as (B, N, K) then transposed (the layout the
-direct-to-LDS b loads expect); C is (B, M, N) row-major. ``make_bmm_inputs`` always builds
-SHARED-A (one (M, K) reused across the batch, ``a.stride(0) == 0``) — the shared-LHS layout;
-we always benchmark shared-A, since distinct-A flatters TLX (rocBLAS reads shared-A once).
-
-For the standard torch.bmm / inductor layout (ROW-major B, stride_bn == 1) see the
-companion ``amd_bmm_shared_perf.py``, which uses num_warps=8 + matrix_instr_nonkdim=32
-(the row-major winning config; nw=8 does not compile with this column-major kernel's
-swizzle + 4-warp split store) and is the shared-A vs rocBLAS perf reproducer.
-
-ONE kernel, two load paths selected by a ``USE_DIRECT`` constexpr the launcher sets from K's
-alignment (``K % BLOCK_K == 0``):
-
-  * USE_DIRECT=1  (aligned rows): the fast async direct-to-LDS path (``buffer_load_to_local`` —
-    global -> LDS with no register round-trip). Beats rocBLAS on short/medium-K shapes.
-  * USE_DIRECT=0  (odd / unaligned / K%BLOCK_K != 0): a register path (``tl.load`` -> registers ->
-    ``tlx.local_store``, masked K-tail) that lowers for ANY row-stride alignment where direct-to-LDS
-    is illegal on CDNA4 (odd K -> 2-byte-aligned rows). Wins the odd-K shapes.
-
-Shared by both paths — the levers that beat the vendor on this occupancy-saturated BMM family:
-  * num_warps=4  -> 2 workgroups co-resident per CU: the two WGs drift out of phase and the hardware
-    overlaps one WG's MFMA with the other's loads for free (inter-WG "ping-pong").
-  * Swizzled + padded LDS (``padded_shared_layout_encoding``) -> bank-conflict-free ``ds_read_b128``.
-  * L2 XCD-chunk remap (``_chip``) -> a batch's M-tiles stay on one XCD, keeping B hot in L2.
-  * int64 per-batch base advance (batch*M*K can exceed 2**31); within-tile offsets stay int32.
-  * ``% M`` / ``% N`` wrap on load indices -> OOB rows re-read valid data (L2), never HBM garbage.
-  * NB-deep software pipeline (prologue prime / steady overlap / epilogue drain).
-  * 4-warp coalesced split-store ([128, 256] -> two [128, 128] dwordx4 stores).
-
-Exposes ``bmm(a, b)`` for the correctness / perf suites.
->>>>>>> 29f89d52c1 ([AMD][gfx950][TLX] a16w16 batched GEMM tutorial (amd_bmm))
 """
 import os
 
@@ -139,7 +106,7 @@ def amd_bmm_kernel(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, s
     bo = on[None, :] * sbn
     KI = tl.cdiv(K, BLOCK_K)
 
-    # ---- prologue: prime NB LDS buffers ----
+    # Prime NB LDS buffers before the steady state so tile 0 is already resident.
     for i in tl.range(0, NB, loop_unroll_factor=NB):
         kk = i * BLOCK_K
         if USE_DIRECT:
@@ -160,7 +127,7 @@ def amd_bmm_kernel(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, s
     b = tlx.local_load(tlx.local_view(sB, 0))
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    # ---- steady-state pipeline: compute tile k while prefetching tile k+NB ----
+    # Steady state: tile k computes while tile k+NB is still in flight.
     for k in tl.range(0, KI - NB):
         cur = (k + 1) % NB
         pf = k % NB
@@ -181,7 +148,7 @@ def amd_bmm_kernel(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, s
         a = tlx.local_load(tlx.local_view(sA, cur))
         b = tlx.local_load(tlx.local_view(sB, cur))
 
-    # ---- epilogue: drain the last NB tiles ----
+    # Drain the NB tiles the prologue put in flight but the loop never consumed.
     acc = tl.dot(a, b, acc)
     if USE_DIRECT:
         tlx.async_load_wait_group(0)
@@ -189,7 +156,8 @@ def amd_bmm_kernel(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, s
         bf = (KI - (NB - 1) + i) % NB
         acc = tl.dot(tlx.local_load(tlx.local_view(sA, bf)), tlx.local_load(tlx.local_view(sB, bf)), acc)
 
-    # ---- 4-warp coalesced split-store ----
+    # Split the [BLOCK_M, BLOCK_N] accumulator into two N-halves so each of the 4
+    # warps stores 8 contiguous N per thread (dwordx4).
     et = c_ptr.dtype.element_ty
     cb = c_ptr + bid.to(tl.int64) * scb
     HN: tl.constexpr = BLOCK_N // 2
@@ -210,7 +178,6 @@ def bmm(a, b, block_m=None, nw=4, nb=None):
     Bs, M, K = a.shape
     _, _, N = b.shape
     bm = block_m or int(os.environ.get("BM_BMM", "128"))
-<<<<<<< HEAD
     # _C4 is a pinned [128,128] store layout (see its definition), so the epilogue
     # require_layout only matches at bm == 128. Fail here rather than deep inside
     # the compiler if BM_BMM / block_m is overridden.
@@ -224,11 +191,6 @@ def bmm(a, b, block_m=None, nw=4, nb=None):
     # over-read past K and re-accumulate tile 0. Requiring KI >= 2 makes
     # min(NB, KI) >= 2 on its own -- a max(2, ...) here would defeat the clamp.
     nb = min(nb, KI)
-=======
-    A_BASES = tuple(tuple(x) for x in _swz([bm, BLOCK_K], 1))
-    nb = nb or int(os.environ.get("NB_BMM", NB))
-    nb = min(nb, triton.cdiv(K, BLOCK_K))  # prologue needs KI >= NB
->>>>>>> 29f89d52c1 ([AMD][gfx950][TLX] a16w16 batched GEMM tutorial (amd_bmm))
     use_direct = (K % BLOCK_K == 0)  # aligned, no K-tail -> fast direct-to-LDS
     GM = triton.cdiv(M, bm) * triton.cdiv(N, BLOCK_N)
     NT = Bs * GM
