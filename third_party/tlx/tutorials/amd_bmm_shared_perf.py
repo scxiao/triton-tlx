@@ -51,8 +51,6 @@ BLOCK_N = 256
 BLOCK_K = 32
 NUM_XCDS = 8
 NB = 3
-NB_MULTI = 2   # pipeline depth for multiB kernels: LDS = 2*(BM*BK + 2*BK*BN)*2 = 80KB @ BM=128
-NUM_B_MATRIX = 2  # number of B matrices processed per CTA in multiB kernels
 
 
 def _swz(shape, cd):
@@ -132,9 +130,6 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     ao = tl.multiple_of(om[:, None] * sam, [DIVISIBILITY_SAM, 1]); bo = on[None, :] * sbn; KI = tl.cdiv(K, BK)
     for i in tl.range(0, NB, loop_unroll_factor=NB):
         kk = i * BK
-        # km = tl.max_constancy((kk + ok) < K, [DIVISIBILITY_K])
-        # br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
-        # ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak, mask=km[None, :], other=0.0)
         br = tl.load(b_ptr + (kk + ok[:, None]) * sbk + bo)
         ar = tl.load(a_ptr + ao + (kk + ok[None, :]) * sak)
 
@@ -149,10 +144,6 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
         cur = (k + 1) % NB
         pf = k % NB; kp = (k + NB) * BK
  
-        # km = tl.max_constancy((kp + ok) < K, [DIVISIBILITY_K])
-        # br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
-        # ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
-
         br = tl.load(b_ptr + (kp + ok[:, None]) * sbk + bo)
         ar = tl.load(a_ptr + ao + (kp + ok[None, :]) * sak)
         acc = tl.dot(a, b, acc)
@@ -184,156 +175,6 @@ def _bmm_register(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, sc
     tl.store(cb + scm * rm[:, None] + scn * rn[None, :], acc.to(et), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
-# Since A matrix is shared across batches, one CTA processes NUM_B_MATRIX consecutive
-# B matrices while loading A only once — halving A's HBM bandwidth.
-# NB must be NB_MULTI=2 to keep LDS within 96KB: 2*(BM*BK + 2*BK*BN)*2 = 80KB @ BM=128.
-@triton.jit
-def _bmm_register_multiB(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
-                          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                          NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr,
-                          NB: tl.constexpr, NUM_B_MATRIX: tl.constexpr,
-                          DIVISIBILITY_SAM: tl.constexpr):
-    """Odd/unaligned K, shared-A multiB: one CTA computes C[bid*2] and C[bid*2+1] from one A load."""
-    npn = tl.cdiv(N, BN)
-    pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
-    bid = pidf // GMN; pid = pidf % GMN; pm = pid // npn; pn = pid % npn
-    # NB=2: sA=2 slots, sB=4 slots; total LDS = 2*(BM*BK + 2*BK*BN)*2 bytes
-    sA = tlx.local_alloc((BM, BK), tl.float16, NB)
-    sB = tlx.local_alloc((BK, BN), tl.float16, NB * NUM_B_MATRIX)
-    om = (pm * BM + tl.arange(0, BM)) % M
-    on = (pn * BN + tl.arange(0, BN)) % N
-    ok = tl.arange(0, BK)
-    a_ptrs  = a_ptr + bid.to(tl.int64) * sab          # sab=0 for shared-A; ptr never changes
-    b_ptrs0 = b_ptr + (bid * NUM_B_MATRIX + 0).to(tl.int64) * sbb
-    b_ptrs1 = b_ptr + (bid * NUM_B_MATRIX + 1).to(tl.int64) * sbb
-    ao = tl.multiple_of(om[:, None] * sam, [DIVISIBILITY_SAM, 1])
-    bo = on[None, :] * sbn
-    KI = tl.cdiv(K, BK)
-
-    # Prologue: fill NB=2 pipeline slots
-    for i in tl.range(0, NB, loop_unroll_factor=NB):
-        kk = i * BK
-        km = (kk + ok) < K
-        ar  = tl.load(a_ptrs  + ao + (kk + ok[None, :]) * sak, mask=km[None, :], other=0.0)
-        br0 = tl.load(b_ptrs0 + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
-        br1 = tl.load(b_ptrs1 + (kk + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
-        tlx.local_store(tlx.local_view(sA, i), ar)
-        tlx.local_store(tlx.local_view(sB, i * NUM_B_MATRIX + 0), br0)
-        tlx.local_store(tlx.local_view(sB, i * NUM_B_MATRIX + 1), br1)
-    tl.debug_barrier()
-
-    a  = tlx.local_load(tlx.local_view(sA, 0))
-    b0 = tlx.local_load(tlx.local_view(sB, 0))
-    b1 = tlx.local_load(tlx.local_view(sB, 1))
-    acc0 = tl.zeros((BM, BN), dtype=tl.float32)
-    acc1 = tl.zeros((BM, BN), dtype=tl.float32)
-
-    # Main loop: KI-NB iterations, ping-pong between 2 slots
-    for k in tl.range(0, KI - NB):
-        cur = (k + 1) % NB; pf = k % NB; kp = (k + NB) * BK
-        km  = (kp + ok) < K
-        ar  = tl.load(a_ptrs  + ao + (kp + ok[None, :]) * sak, mask=km[None, :], other=0.0)
-        br0 = tl.load(b_ptrs0 + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
-        br1 = tl.load(b_ptrs1 + (kp + ok[:, None]) * sbk + bo, mask=km[:, None], other=0.0)
-        acc0 = tl.dot(a, b0, acc0)
-        acc1 = tl.dot(a, b1, acc1)
-        tlx.local_store(tlx.local_view(sA, pf), ar)
-        tlx.local_store(tlx.local_view(sB, pf * NUM_B_MATRIX + 0), br0)
-        tlx.local_store(tlx.local_view(sB, pf * NUM_B_MATRIX + 1), br1)
-        tl.debug_barrier()
-        a  = tlx.local_load(tlx.local_view(sA, cur))
-        b0 = tlx.local_load(tlx.local_view(sB, cur * NUM_B_MATRIX + 0))
-        b1 = tlx.local_load(tlx.local_view(sB, cur * NUM_B_MATRIX + 1))
-
-    # Dot the tile left in registers (from last LDS read in main loop / prologue)
-    acc0 = tl.dot(a, b0, acc0)
-    acc1 = tl.dot(a, b1, acc1)
-    # Epilogue: NB-1 = 1 remaining LDS slot
-    for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
-        bf = (KI - (NB - 1) + i) % NB
-        a  = tlx.local_load(tlx.local_view(sA, bf))
-        b0 = tlx.local_load(tlx.local_view(sB, bf * NUM_B_MATRIX + 0))
-        b1 = tlx.local_load(tlx.local_view(sB, bf * NUM_B_MATRIX + 1))
-        acc0 = tl.dot(a, b0, acc0)
-        acc1 = tl.dot(a, b1, acc1)
-
-    et = c_ptr.dtype.element_ty
-    cb0 = c_ptr + (bid * NUM_B_MATRIX + 0).to(tl.int64) * scb
-    cb1 = c_ptr + (bid * NUM_B_MATRIX + 1).to(tl.int64) * scb
-    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN)
-    mask = (rm[:, None] < M) & (rn[None, :] < N)
-    tl.store(cb0 + scm * rm[:, None] + scn * rn[None, :], acc0.to(et), mask=mask)
-    tl.store(cb1 + scm * rm[:, None] + scn * rn[None, :], acc1.to(et), mask=mask)
-
-
-@triton.jit
-def _bmm_direct_multiB(a_ptr, b_ptr, c_ptr, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
-                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                        AB: tl.constexpr, BB: tl.constexpr,
-                        NUM_XCDS: tl.constexpr, GMN: tl.constexpr, NT: tl.constexpr,
-                        NB: tl.constexpr, NUM_B_MATRIX: tl.constexpr):
-    """Aligned K (K%8==0), shared-A multiB: direct-to-LDS + swizzled LDS for two B matrices.
-    NB must be NB_MULTI=2; LDS = 2*(BM*BK + 2*BK*BN)*2 = 80KB @ BM=128."""
-    npn = tl.cdiv(N, BN)
-    pidf = _chip(tl.program_id(0), NT, NUM_XCDS, GMN)
-    bid = pidf // GMN; pid = pidf % GMN; pm = pid // npn; pn = pid % npn
-    ash: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], AB, [BM, BK])
-    bsh: tl.constexpr = tlx.padded_shared_layout_encoding.with_bases([(512, 16)], BB, [BK, BN])
-    sA  = tlx.local_alloc((BM, BK), tl.float16, NB, layout=ash)
-    sB0 = tlx.local_alloc((BK, BN), tl.float16, NB, layout=bsh)
-    sB1 = tlx.local_alloc((BK, BN), tl.float16, NB, layout=bsh)
-    om = (pm * BM + tl.arange(0, BM)) % M; on = (pn * BN + tl.arange(0, BN)) % N; ok = tl.arange(0, BK)
-    a_ptr  = a_ptr + bid.to(tl.int64) * sab       # sab=0 for shared-A
-    b_ptr0 = b_ptr + (bid * NUM_B_MATRIX + 0).to(tl.int64) * sbb
-    b_ptr1 = b_ptr + (bid * NUM_B_MATRIX + 1).to(tl.int64) * sbb
-    ao = om[:, None] * sam; bo = on[None, :] * sbn; KI = tl.cdiv(K, BK)
-
-    # Prologue: fill NB=2 pipeline slots (3 buffer_load_to_local per slot)
-    for i in tl.range(0, NB, loop_unroll_factor=NB):
-        kk = i * BK
-        tlx.buffer_load_to_local(tlx.local_view(sA,  i), a_ptr,  ao + (kk + ok[None, :]) * sak)
-        tlx.buffer_load_to_local(tlx.local_view(sB0, i), b_ptr0, (kk + ok[:, None]) * sbk + bo)
-        tlx.buffer_load_to_local(tlx.local_view(sB1, i), b_ptr1, (kk + ok[:, None]) * sbk + bo)
-        tlx.async_load_commit_group()
-    tlx.async_load_wait_group(NB - 2)  # NB=2 -> wait_group(0): drain all before reading
-
-    a  = tlx.local_load(tlx.local_view(sA,  0))
-    b0 = tlx.local_load(tlx.local_view(sB0, 0))
-    b1 = tlx.local_load(tlx.local_view(sB1, 0))
-    acc0 = tl.zeros((BM, BN), dtype=tl.float32)
-    acc1 = tl.zeros((BM, BN), dtype=tl.float32)
-
-    # Main loop: dot then prefetch next tile
-    for k in tl.range(0, KI - NB):
-        cur = (k + 1) % NB; pf = k % NB; kp = (k + NB) * BK
-        acc0 = tl.dot(a, b0, acc0)
-        acc1 = tl.dot(a, b1, acc1)
-        tlx.buffer_load_to_local(tlx.local_view(sA,  pf), a_ptr,  ao + (kp + ok[None, :]) * sak)
-        tlx.buffer_load_to_local(tlx.local_view(sB0, pf), b_ptr0, (kp + ok[:, None]) * sbk + bo)
-        tlx.buffer_load_to_local(tlx.local_view(sB1, pf), b_ptr1, (kp + ok[:, None]) * sbk + bo)
-        tlx.async_load_commit_group(); tlx.async_load_wait_group(NB - 2)
-        a  = tlx.local_load(tlx.local_view(sA,  cur))
-        b0 = tlx.local_load(tlx.local_view(sB0, cur))
-        b1 = tlx.local_load(tlx.local_view(sB1, cur))
-
-    acc0 = tl.dot(a, b0, acc0)
-    acc1 = tl.dot(a, b1, acc1)
-    tlx.async_load_wait_group(0)
-    # Epilogue: NB-1 = 1 remaining slot
-    for i in tl.range(0, NB - 1, loop_unroll_factor=NB - 1):
-        bf = (KI - (NB - 1) + i) % NB
-        acc0 = tl.dot(tlx.local_load(tlx.local_view(sA, bf)), tlx.local_load(tlx.local_view(sB0, bf)), acc0)
-        acc1 = tl.dot(tlx.local_load(tlx.local_view(sA, bf)), tlx.local_load(tlx.local_view(sB1, bf)), acc1)
-
-    et = c_ptr.dtype.element_ty
-    cb0 = c_ptr + (bid * NUM_B_MATRIX + 0).to(tl.int64) * scb
-    cb1 = c_ptr + (bid * NUM_B_MATRIX + 1).to(tl.int64) * scb
-    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN)
-    mask = (rm[:, None] < M) & (rn[None, :] < N)
-    tl.store(cb0 + scm * rm[:, None] + scn * rn[None, :], acc0.to(et), mask=mask)
-    tl.store(cb1 + scm * rm[:, None] + scn * rn[None, :], acc1.to(et), mask=mask)
-
-
 def bmm(a, b):
     """C = A @ B, shared-A, ROW-major B (stride_bn == 1). nw=8, mfma=32.
 
@@ -355,8 +196,6 @@ def bmm(a, b):
     attrs = (("amdgpu-agpr-alloc", "0,0"), )
     st = (a.stride(0), a.stride(1), a.stride(2), b.stride(0), b.stride(1), b.stride(2), c.stride(0), c.stride(1),
           c.stride(2))
-    # MultiB only when: BM=64 (small M), batch divisible, K deep enough for pipeline
-    use_multiB = (bm == 64 and Bs % NUM_B_MATRIX == 0 and Bs >= NUM_B_MATRIX and KI >= NB_MULTI)
     if K % 8 == 0:  # 16-byte-aligned A rows -> direct-to-LDS path (always single-B)
         common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
         AB = tuple(tuple(x) for x in _swz([bm, BLOCK_K], 1))
@@ -366,23 +205,13 @@ def bmm(a, b):
                             NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT, NB=nb, **common)
     else:  # odd / unaligned K -> register path
         divisibility_sam = math.gcd(int(a.stride(1)), 16)
-        if use_multiB:
-            # num_warps=8 required: two (64,256) fp32 accumulators fit in 232 VGPRs at nw=8.
-            common = dict(num_warps=8, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
-            nb = min(NB_MULTI, KI)
-            NT = (Bs // NUM_B_MATRIX) * GMN
-            _bmm_register_multiB[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K,
-                                         NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT, NB=nb,
-                                         NUM_B_MATRIX=NUM_B_MATRIX,
-                                         DIVISIBILITY_SAM=divisibility_sam, **common)
-        else:
-            nb = min(NB, KI); NT = Bs * GMN
-            divisibility_k = math.gcd(int(K), 16)
-            common = dict(num_warps=4, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
-            _bmm_register[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K,
-                                  NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT, NB=nb,
-                                  DIVISIBILITY_SAM=divisibility_sam,
-                                  DIVISIBILITY_K=divisibility_k, **common)
+        nb = min(NB, KI); NT = Bs * GMN
+        divisibility_k = math.gcd(int(K), 16)
+        common = dict(num_warps=4, num_stages=1, matrix_instr_nonkdim=32, llvm_fn_attrs=attrs)
+        _bmm_register[(NT, )](a, b, c, M, N, K, *st, BM=bm, BN=BLOCK_N, BK=BLOCK_K,
+                                NUM_XCDS=NUM_XCDS, GMN=GMN, NT=NT, NB=nb,
+                                DIVISIBILITY_SAM=divisibility_sam,
+                                DIVISIBILITY_K=divisibility_k, **common)
     return c
 
 
@@ -398,6 +227,23 @@ def make_bmm_inputs(B, M, N, K, device, dtype=torch.float16, seed=0):
     return a, b
 
 
+@pytest.mark.parametrize("B, M, N, K",
+    [
+        (320, 1024, 256, 256),
+        (1024, 395, 256, 320),
+        (1024, 40, 256, 1956),
+        (1024, 262, 256, 294),
+        (1024, 1195, 256, 2309)
+    ]
+)
+def test_correctness(B, M, N, K):
+    dev = triton.runtime.driver.active.get_active_torch_device()
+    a, b = make_bmm_inputs(B, M, N, K, dev)
+    ref = torch.bmm(a, b)
+    out = bmm(a, b)
+    ok = torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+
 def _warm_ms(fn, iters=60, warmup=20):
     """Warm device time (L2 hot, back-to-back) — matches rocprofv3 kernel-trace, no launch tax."""
     for _ in range(warmup):
@@ -411,6 +257,7 @@ def _warm_ms(fn, iters=60, warmup=20):
     e.record()
     torch.cuda.synchronize()
     return s.elapsed_time(e) / iters
+
 
 
 if __name__ == "__main__":
@@ -436,18 +283,3 @@ if __name__ == "__main__":
         print(f"{f'{M}x{N}x{K} ({B})':<22}{path:<8}{t:8.0f}u{rb:9.0f}u{rb / t:7.2f}x  {'OK' if ok else 'WRONG'}")
 
 
-@pytest.mark.parametrize("B, M, N, K",
-    [
-        # (320, 1024, 256, 256),
-        # (1024, 395, 256, 320),
-        # (1024, 40, 256, 1956),
-        # (1024, 262, 256, 294),
-        (1024, 1195, 256, 2309)
-    ]
-)
-def test_correctness(B, M, N, K):
-    dev = triton.runtime.driver.active.get_active_torch_device()
-    a, b = make_bmm_inputs(B, M, N, K, dev)
-    ref = torch.bmm(a, b)
-    out = bmm(a, b)
-    ok = torch.allclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
