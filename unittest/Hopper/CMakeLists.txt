@@ -11,6 +11,12 @@ add_triton_ut(
   SRCS z3_constraint_encoder_test.cpp
   LIBS
     TritonGPUModuloCore
+    TritonAnalysis
+    TritonGPUIR
+    TritonNvidiaGPUIR
+    TritonGPUTransforms
+    TritonNvidiaGPUTransforms
+    TLXIR
 )
 
 add_triton_ut(
