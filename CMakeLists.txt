@@ -25,6 +25,7 @@ option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
 option(TRITON_BUILD_TLX "Build Triton TLX" ON)
 option(TRITON_OFFLINE_BUILD "Build without downloading dependencies" OFF)
 option(TRITON_EXT_ENABLED "Build with default visibility for Triton+LLVM symbol exposure to plugin extensions" OFF)
+option(TRITON_ENABLE_Z3_JOINT_SOLVER "Enable the native Z3 joint modulo scheduler" OFF)
 set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 set(TRITON_VERSION "" CACHE STRING "Triton version string (passed from setup.py)")
 
@@ -231,6 +232,9 @@ find_package(MLIR REQUIRED CONFIG PATHS ${MLIR_DIR})
 
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+if(TRITON_ENABLE_Z3_JOINT_SOLVER)
+  find_package(Z3 REQUIRED)
+endif()
 
 include(TableGen) # required by AddMLIR
 include(AddLLVM)
@@ -272,7 +276,7 @@ endfunction()
 # Compiler flags
 ################################################################################
 
-# Disable warnings that show up in external code (gtest;pybind11)
+# Disable warnings that show up in external code (gtest;nanobind)
 if(NOT MSVC)
   set(TRITON_DISABLE_EH_RTTI_FLAGS "$<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions;-fno-rtti>")
   if(NOT TRITON_EXT_ENABLED)
@@ -317,7 +321,21 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   # Python Interpreter is used to run lit tests
   find_package(Python3 REQUIRED COMPONENTS Development.Module Interpreter)
-  find_package(pybind11 CONFIG REQUIRED HINTS "${Python3_SITELIB}")
+  # nanobind expects find_package(Python) which sets Python::Module target
+  # and Python_* variables. Triton uses find_package(Python3) instead.
+  # Bridge the two by aliasing the target and forwarding variables.
+  if(NOT TARGET Python::Module)
+    add_library(Python::Module ALIAS Python3::Module)
+    set(Python_EXECUTABLE "${Python3_EXECUTABLE}")
+    set(Python_INCLUDE_DIRS "${Python3_INCLUDE_DIRS}")
+    set(Python_SOABI "${Python3_SOABI}")
+    set(Python_VERSION "${Python3_VERSION}")
+    set(Python_INTERPRETER_ID "${Python3_INTERPRETER_ID}")
+  endif()
+
+  find_package(nanobind CONFIG REQUIRED HINTS "${Python3_SITELIB}")
+  nanobind_build_library(nanobind-static)
+  target_link_libraries(nanobind-static PRIVATE Python3::Module)
 
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})
@@ -385,7 +403,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     LLVMAMDGPUAsmParser
 
     Python3::Module
-    pybind11::headers
+    nanobind-static
   )
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR # Linux arm64
      CMAKE_SYSTEM_PROCESSOR MATCHES "arm64" OR # macOS arm64

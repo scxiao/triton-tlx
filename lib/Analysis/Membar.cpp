@@ -10,46 +10,44 @@
 
 namespace mlir {
 
-/// Given a value that may be produced by a chain of memdesc_index operations,
-/// narrow the parent buffer's interval to the sub-range actually accessed.
-/// memdesc_index selects a contiguous slice along the leading dimension, so if
-/// the index is a compile-time constant we can compute the exact byte range.
-/// This avoids false hazards when different indices of the same buffer are
-/// accessed (e.g. initializing elements of a barrier array).
+/// Given a value produced by memdesc_index, possibly wrapped in transparent
+/// memdesc views, narrow the parent buffer's interval to the sub-range actually
+/// accessed. memdesc_index selects a contiguous slice along the leading
+/// dimension, so a compile-time constant index identifies an exact byte range.
+/// Nested memdesc_index operations are verifier-invalid.
 static Interval<size_t> narrowIntervalForSubview(Value value,
                                                  Interval<size_t> interval) {
-  while (auto indexOp = value.getDefiningOp<triton::gpu::MemDescIndexOp>()) {
-    auto parentType =
-        cast<triton::gpu::MemDescType>(indexOp.getSrc().getType());
-
-    // Only narrow when the index is a compile-time constant.
-    APInt indexVal;
-    if (!matchPattern(indexOp.getIndex(), m_ConstantInt(&indexVal)))
+  triton::gpu::MemDescIndexOp indexOp;
+  while (Operation *defOp = value.getDefiningOp()) {
+    if ((indexOp = dyn_cast<triton::gpu::MemDescIndexOp>(defOp)))
       break;
-
-    int64_t idx = indexVal.getSExtValue();
-    int64_t dim0 = parentType.getShape()[0];
-    size_t totalSize = interval.end() - interval.start();
-
-    // Ensure the stride divides evenly (should always hold for well-formed IR).
-    if (dim0 <= 0 || totalSize % dim0 != 0)
-      break;
-
-    size_t stride = totalSize / dim0;
-    size_t newStart = interval.start() + idx * stride;
-    size_t newEnd = newStart + stride;
-    interval = Interval<size_t>(newStart, newEnd);
-
-    // Continue tracing through the parent in case of nested indexing.
-    value = indexOp.getSrc();
+    if (!defOp->hasTrait<OpTrait::MemDescViewTrait>())
+      return interval;
+    value = defOp->getOperand(0);
   }
-  return interval;
+  if (!indexOp)
+    return interval;
+
+  APInt indexVal;
+  if (!matchPattern(indexOp.getIndex(), m_ConstantInt(&indexVal)))
+    return interval;
+
+  auto parentType = cast<triton::gpu::MemDescType>(indexOp.getSrc().getType());
+  int64_t dim0 = parentType.getShape()[0];
+  size_t totalSize = interval.end() - interval.start();
+  if (dim0 <= 0 || totalSize % dim0 != 0)
+    return interval;
+
+  size_t stride = totalSize / dim0;
+  size_t newStart = interval.start() + indexVal.getSExtValue() * stride;
+  return Interval<size_t>(newStart, newStart + stride);
 }
 
 AllocationSlice::AllocationSlice(Value value,
                                  Interval<size_t> allocationInterval,
                                  Allocation::BufferId bufferId)
-    : allocationInterval(allocationInterval), bufferId(bufferId) {
+    : allocationInterval(narrowIntervalForSubview(value, allocationInterval)),
+      bufferId(bufferId) {
   auto accessTy = cast<triton::gpu::MemDescType>(value.getType());
   this->accessTy = accessTy;
 
@@ -293,6 +291,20 @@ bool containsLocalBarrier(Operation *op) {
   return false;
 }
 
+// Returns true if the same block has a later wait or local barrier before any
+// memory effect or nested control flow.
+static bool hasSyncPointBeforeMemoryEffect(Operation *op) {
+  for (Operation *next = op->getNextNode(); next; next = next->getNextNode()) {
+    if (containsLocalBarrier(next) ||
+        next->hasTrait<mlir::OpTrait::MemWaitOpTrait>())
+      return true;
+
+    if (isa<RegionBranchOpInterface>(next) || !isMemoryEffectFree(next))
+      return false;
+  }
+  return false;
+}
+
 void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                             FuncBlockInfoMapT *funcBlockInfoMap,
                             OpBuilder *builder) {
@@ -302,10 +314,11 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     return;
   }
 
+  // If the current op is an (async) memory wait and there is no later sync
+  // point before memory is accessed, insert a barrier op and sync. This avoids
+  // redundant barriers by deferring the barrier to the later sync point.
   if (op->hasTrait<mlir::OpTrait::MemWaitOpTrait>() &&
-      !containsLocalBarrier(op->getNextNode())) {
-    // If the current op is an async wait and the next op is not a barrier we
-    // insert a barrier op and sync
+      !hasSyncPointBeforeMemoryEffect(op)) {
     builder->setInsertionPointAfter(op);
     insertBarrier(op, builder);
     blockInfo->sync();
@@ -352,6 +365,7 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                  allocation->getAllBufferIdsWithAliases(value)) {
               if (bufferId != Allocation::InvalidBufferId) {
                 auto interval = allocation->getAllocatedInterval(bufferId);
+                interval = narrowIntervalForSubview(value, interval);
                 auto slice = AllocationSlice(value, interval, bufferId);
 
                 if (isa<MemoryEffects::Write>(effectInstance.getEffect()))
@@ -363,8 +377,8 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
           }
         }
       }
-      // If this op may be signalling other threads asynchronously, make sure
-      // all shared memory transactions are complete beforehand.
+      // If this op may signal other threads asynchronously, make sure all
+      // shared-memory transactions in this partition are complete first.
       if (isa<triton::nvidia_gpu::ArriveBarrierOp>(op)) {
         Interval<size_t> allIntervals(0, std::numeric_limits<size_t>::max());
         auto allMemorySlice = AllocationSlice(allIntervals);

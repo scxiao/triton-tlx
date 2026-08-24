@@ -6,7 +6,10 @@ import pytest
 
 import pathlib
 import uuid
-from triton._internal_testing import is_cuda, is_hip_cdna, is_rubin
+from triton._internal_testing import is_cuda, is_hip_cdna2, is_rubin
+from triton.backends.amd.compiler import HIPBackend
+from triton.backends.compiler import GPUTarget
+from triton.backends.nvidia.compiler import CUDABackend
 from triton.runtime import autotuner as _autotuner
 
 
@@ -14,6 +17,40 @@ def do_bench(kernel_call, quantiles, use_cuda_graph=False):
     if use_cuda_graph:
         return triton.testing.do_bench_cudagraph(kernel_call, quantiles=quantiles)
     return triton.testing.do_bench(kernel_call, quantiles=quantiles, warmup=1, rep=1)
+
+
+@pytest.mark.parametrize(
+    "probe_ms, expected",
+    [(0.001, 10000), (0.1, 2500), (1.0, 250), (24.0, 10), (100.0, 2)],
+)
+def test_entropy_warmup_sample_budget(probe_ms, expected):
+    assert _autotuner._entropy_warmup_sample_limit(probe_ms, 250) == expected
+
+
+def test_config_backend_options():
+    default_config = triton.Config(kwargs={})
+    tree_config = triton.Config(kwargs={}, enable_tree_reduction=True)
+    linear_config = triton.Config(kwargs={}, enable_tree_reduction=False)
+    dependent_two_cta_config = triton.Config(kwargs={}, allowDependentTwoCTA=True)
+
+    assert "enable_tree_reduction" not in default_config.all_kwargs()
+    assert tree_config.all_kwargs()["enable_tree_reduction"] is True
+    assert linear_config.all_kwargs()["enable_tree_reduction"] is False
+    assert "allowDependentTwoCTA" not in default_config.all_kwargs()
+    assert dependent_two_cta_config.all_kwargs()["allowDependentTwoCTA"] is True
+
+    amd_backend = HIPBackend(GPUTarget("hip", "gfx942", 64))
+    assert amd_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert amd_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
+    assert amd_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
+
+    h100_backend = CUDABackend(GPUTarget("cuda", 90, 32))
+    blackwell_backend = CUDABackend(GPUTarget("cuda", 100, 32))
+    assert h100_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is True
+    assert blackwell_backend.parse_options(default_config.all_kwargs()).enable_tree_reduction is False
+    assert h100_backend.parse_options(linear_config.all_kwargs()).enable_tree_reduction is False
+    assert blackwell_backend.parse_options(tree_config.all_kwargs()).enable_tree_reduction is True
+    assert blackwell_backend.parse_options(dependent_two_cta_config.all_kwargs()).allowDependentTwoCTA is True
 
 
 @pytest.mark.parametrize('use_cuda_graph', [False, True])
@@ -148,7 +185,7 @@ def test_restore_with_none(pass_kwargs_to_kernel, device):
     triton.testing.assert_close(dst, torch.ones_like(dst))
 
 
-@pytest.mark.skipif(is_hip_cdna(), reason="Hit LLVM assertion in splitLiveThroughBlock")
+@pytest.mark.skipif(is_hip_cdna2(), reason="Hit LLVM assertion in splitLiveThroughBlock")
 def test_hooks(device):
     # Autotuner's pre- and post- hooks should be called the same number of times
     N = 4096
@@ -235,6 +272,114 @@ def test_prune_configs(with_perf_model: bool, device: str):
         assert records['run_early_config_prune']
         assert records['capture_kwargs']
         assert records['capture_named_args']
+
+
+def test_prune_configs_fractional_top_k_keeps_one(device: str):
+    # A fractional top_k that rounds down to zero for a small config set must
+    # still keep one config instead of pruning them all and crashing the later
+    # min() on an empty set: here int(2 * 0.3) == 0.
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+
+    def perf_model(*args, **kwargs):
+        return kwargs['BLOCK_SIZE']
+
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': 32}), triton.Config(kwargs={'BLOCK_SIZE': 128})]
+    prune_configs_by = {'perf_model': perf_model, 'top_k': 0.3}
+
+    @triton.autotune(configs=configs, key=['N'], prune_configs_by=prune_configs_by, do_bench=do_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    _kernel[grid](dst, src, N=N)
+    torch.testing.assert_close(src, dst)
+
+
+@pytest.mark.parametrize("prune_kind", ["early_config_prune", "perf_model"])
+def test_pruned_single_config_skips_benchmark(prune_kind: str, device: str, fresh_knobs):
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+    records = {}
+    captured = []
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': 32}), triton.Config(kwargs={'BLOCK_SIZE': 128})]
+    fresh_knobs.autotuning.print = True
+    fresh_knobs.autotuning.listener = lambda **kwargs: captured.append(kwargs)
+
+    def do_not_bench(kernel_call, quantiles):
+        records['run_do_bench'] = True
+        raise AssertionError("autotune benchmark should be skipped for a single pruned config")
+
+    if prune_kind == "early_config_prune":
+
+        def early_config_prune(configs, named_args, **kwargs):
+            records['run_early_config_prune'] = True
+            return [configs[1]]
+
+        prune_configs_by = {'early_config_prune': early_config_prune}
+    else:
+
+        def perf_model(*args, **kwargs):
+            records['run_perf_model'] = True
+            return 0 if kwargs['BLOCK_SIZE'] == 128 else 1
+
+        prune_configs_by = {'perf_model': perf_model, 'top_k': 1}
+
+    @triton.autotune(configs=configs, key=['N'], prune_configs_by=prune_configs_by, do_bench=do_not_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    _kernel[grid](dst, src, N=N)
+    torch.testing.assert_close(src, dst)
+    assert _kernel.best_config == configs[1]
+    assert 'run_do_bench' not in records
+    assert captured == []
+
+
+def test_pruned_single_config_preserves_ir_pruning(device: str):
+    N = 1024
+    src = torch.randn(N, device=device)
+    dst = torch.empty(N, device=device)
+    records = {}
+    configs = [triton.Config(kwargs={'BLOCK_SIZE': 32}), triton.Config(kwargs={'BLOCK_SIZE': 128})]
+
+    def early_config_prune(configs, named_args, **kwargs):
+        return [configs[1]]
+
+    def ir_config_prune(config, asm, metadata):
+        records['run_ir_config_prune'] = True
+        return True
+
+    def record_bench(kernel_call, quantiles):
+        records['run_do_bench'] = True
+        return do_bench(kernel_call, quantiles)
+
+    prune_configs_by = {
+        'early_config_prune': early_config_prune,
+        'ir_config_prune': ir_config_prune,
+    }
+
+    @triton.autotune(configs=configs, key=['N'], prune_configs_by=prune_configs_by, do_bench=record_bench)
+    @triton.jit
+    def _kernel(dst, src, N, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        x = tl.load(src + offsets, mask=offsets < N)
+        tl.store(dst + offsets, x, mask=offsets < N)
+
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']), )
+    _kernel[grid](dst, src, N=N)
+    torch.testing.assert_close(src, dst)
+    assert _kernel.best_config == configs[1]
+    assert records == {'run_do_bench': True, 'run_ir_config_prune': True}
 
 
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9,

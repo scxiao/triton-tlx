@@ -20,7 +20,7 @@ from setuptools.command.sdist import sdist
 
 from dataclasses import dataclass
 
-import pybind11
+import nanobind
 
 try:
     from setuptools.command.bdist_wheel import bdist_wheel
@@ -37,7 +37,7 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from python.build_helpers import get_base_dir, get_cmake_dir
+from python.build_helpers import check_env_flag, get_base_dir, get_cmake_dir
 
 
 def is_git_repo() -> bool:
@@ -124,11 +124,6 @@ class BackendInstaller:
             BackendInstaller.prepare(backend_name, backend_src_dir=backend_src_dir, is_external=True)
             for backend_name, backend_src_dir in zip(backend_names, backend_dirs)
         ]
-
-
-# Taken from https://github.com/pytorch/pytorch/blob/master/tools/setup_helpers/env.py
-def check_env_flag(name: str, default: str = "") -> bool:
-    return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
 
 
 def get_build_type():
@@ -246,16 +241,11 @@ class CMakeBuild(build_ext):
         for ext in self.extensions:
             self.build_extension(ext)
 
-    def get_pybind11_cmake_args(self):
-        pybind11_sys_path = get_env_with_keys(["PYBIND11_SYSPATH"])
-        if pybind11_sys_path:
-            pybind11_include_dir = os.path.join(pybind11_sys_path, "include")
-        else:
-            pybind11_include_dir = pybind11.get_include()
-        return [f"-Dpybind11_INCLUDE_DIR='{pybind11_include_dir}'", f"-Dpybind11_DIR='{pybind11.get_cmake_dir()}'"]
+    def get_nanobind_cmake_args(self):
+        return [f"-Dnanobind_ROOT='{nanobind.cmake_dir()}'"]
 
     def get_proton_cmake_args(self):
-        cmake_args = self.get_pybind11_cmake_args()
+        cmake_args = self.get_nanobind_cmake_args()
         cupti_include_dir = get_env_with_keys(["TRITON_CUPTI_INCLUDE_PATH"])
         if cupti_include_dir == "":
             cupti_include_dir = os.path.join(get_base_dir(), "third_party", "nvidia", "backend", "include")
@@ -301,7 +291,7 @@ class CMakeBuild(build_ext):
         lit_dir = shutil.which('lit')
         ninja_dir = shutil.which('ninja')
         assert ninja_dir is not None, "ninja not found!"
-        thirdparty_cmake_args = self.get_pybind11_cmake_args()
+        thirdparty_cmake_args = self.get_nanobind_cmake_args()
         extdir = os.path.abspath(os.path.dirname(self.get_ext_fullpath(ext.path)))
         wheeldir = os.path.dirname(extdir)
 

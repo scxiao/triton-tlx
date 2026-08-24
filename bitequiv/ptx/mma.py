@@ -14,20 +14,21 @@ Soundness (over-split, never over-merge):
 - Each DROPPED piece is tiling-free: the m/n tile dims (retiling the SAME dot products across a
   different BLOCK_M / BLOCK_N is bit-identical) and the issue/transpose mods
   (``.mma_async`` / ``.sync`` / ``.aligned`` / ``.row`` / ``.col``).
-- The ``(mma_count, f32-fp-count)`` ratio is GCD-reduced, so proportional M/N tiling (n128 ->
-  2x n64 doubles BOTH counts) reduces to the same ratio (sound merge), while a real K split (which
-  changes the counts disproportionately) stays distinct.
-- fp8 (e4m3/e5m2/...): the ``max_num_imprecise_acc`` periodic-flush cadence is invisible to the
-  reduced ratio, so we FALL BACK to the raw per-token count map + raw fp count (strictly more
-  splitting).
-- tcgen05 M/N/K live in a runtime descriptor, not the modifiers, so tcgen05 K rides the ratio + the
-  caller's ``loops=`` (BLOCK_K) fence rather than the token — conservative.
+- The f32 epilogue fp ops ride as PRESENCE ``(has_fma, has_addmul)`` — NOT a count: the op count
+  scales with the M/N tile (elements per thread) while tcgen05's mma count does not, so a count
+  (even GCD-reduced) cannot cancel the tile scaling and over-splits equivalent re-tilings (measured:
+  num_splits 1..8 x tilings -> 20 classes for a 4-class split-K kernel). Presence keeps
+  enable_fp_fusion (fma single-rounded vs add+mul double-rounded) distinct; the bit-relevant K
+  regrouping rides the token / caller's ``loops=`` (BLOCK_K) / ``splits=`` (num_splits) instead.
+- fp8 (e4m3/e5m2/...): the ``max_num_imprecise_acc`` periodic-flush cadence is invisible even to
+  presence, so we FALL BACK to the raw per-token count map + raw fp count (strictly more splitting).
+- tcgen05 M/N/K live in a runtime descriptor, not the modifiers, so tcgen05 K rides ``loops=``
+  (BLOCK_K) + ``splits=`` (num_splits) rather than the token — conservative.
 
 This module is the single source of truth for both the forward interpreter and the backward
 ``_entry_signature`` (which currently uses the coarser ``_mma_guard``).
 """
 import re
-from math import gcd
 
 from bitequiv.ptx.linker import linearize
 
@@ -44,9 +45,9 @@ _MMA_DTYPES = frozenset({".f64", ".f32", ".tf32", ".f16", ".bf16", ".s32", ".s8"
 # The single tile+K modifier token, e.g. `.m64n128k16` (wgmma / mma.sync / wmma).
 _TILE_RE = re.compile(r"^\.m(\d+)n(\d+)k(\d+)$")
 
-# fp reduce/epilogue ops whose count scales with the MMA tile count, so the GCD-reduced
-# (mma_count, fp_count) ratio cancels proportional M/N tiling. f32 family only (the accumulate /
-# epilogue precision that matters).
+# fp reduce/epilogue ops. Their COUNT scales with the M/N tile (elements per thread), so the fence
+# records only their PRESENCE (has_fma, has_addmul), never the count. f32 family only (the accumulate
+# / epilogue precision that matters).
 _FP_EPI_OPS = frozenset({"add", "sub", "mul", "fma"})
 _FP_EPI_WIDTHS = frozenset({".f32", ".f32x2"})
 
@@ -74,19 +75,73 @@ def _k_of(mods):
     return None
 
 
-def _mma_token(opcode, mods):
-    """Tiling-INVARIANT fence token: keep the bit-relevant facts, drop the free ones.
+# Operand dtype -> accumulation FAMILY (narrowest operand wins; the accumulator is the wider f32).
+# f16 and bf16 map to ONE family "f16": on Blackwell both lower through tcgen05 `.kind::f16` and the
+# same F=25-bit fixed-point accumulate, and a native tcgen05 GEMM does not even encode f16-vs-bf16 in
+# the PTX (see `_mma_token`). tf32/f32 -> "tf32" (a tensor-core f32 input is first rounded to tf32).
+# fp8 kinds are handled separately in `_mma_token` (kept conservative — fp8 is the one v2 != v5 case).
+_FAMILY_PRIORITY = (({".f16", ".bf16"}, "f16"), ({".tf32"}, "tf32"), ({".f64"}, "f64"),
+                    ({".s8", ".u8"}, "s8"), ({".s4", ".u4"}, "s4"), ({".b1"}, "b1"), ({".f32"}, "tf32"))
 
-    tcgen05: M/N/K live in a runtime descriptor (not the modifiers), so they ride the ratio +
-    ``loops=`` instead; keep ``.kind::`` (dtype family -> rounding) and ``.cta_group::`` (2-CTA
-    changes the accumulation). wgmma / mma.sync / wmma: keep K and the operand/accumulator dtypes;
-    drop the m/n tile dims and the issue/transpose mods."""
+
+def _dtype_family(dtypes):
+    """The accumulation family for a set of MMA operand dtypes. Narrowest operand wins because the
+    accumulator is always the wider f32; e.g. ``{.f32, .bf16}`` (acc f32, operands bf16) -> "f16"."""
+    for group, fam in _FAMILY_PRIORITY:
+        if any(d in dtypes for d in group):
+            return fam
+    return "?"
+
+
+def _fence_all_matmul(fence):
+    """True iff every token in an :func:`_mma_fence` is the canonical non-fp8 ``matmul|`` form, i.e.
+    every tensor-core op in the entry accumulates its products EXACTLY (the f16/bf16/tf32 families;
+    fp8's ``max_num_imprecise_acc`` cadence does not, and keeps its native form).
+
+    This is a statement about the MMA DTYPE only. It says nothing about what the loop around the MMA
+    does, so it is NOT on its own a licence to drop the chunk (BLOCK_K) fence — the forward descriptor
+    pairs it with :func:`bitequiv.ptx.forward.loops.is_pure_mma_fold`, which proves the fold structure
+    separately. Reading this predicate as "so the entry is a plain GEMM" is an open-world guess: every
+    tensor-core kernel that is not one (``input_precision=tf32x3``, attention, ...) also passes it."""
+    return fence is not None and fence[0] == "mma" and all(t.startswith("matmul|") for t in fence[1])
+
+
+def _mma_token(opcode, mods):
+    """Form-agnostic, tiling-invariant matmul token. The v2 warp-level MMA (``mma.sync``) and the v5
+    Blackwell MMA (``tcgen05.mma``) that compute the SAME matmul get the SAME token, so the autotuner
+    can move freely between them. Keeps only the bit-relevant facts — the accumulation dtype FAMILY and
+    the CTA group (2-CTA changes the accumulation) — and drops the FORM (mma vs tcgen05), the native
+    m/n/k tile, and the issue/transpose mods (all bit-free re-tilings of the same dot products).
+
+    Why v2 == v5 is sound for f16/bf16/tf32 (INFERRED, not an NVIDIA guarantee): for these types each
+    product ``A*B`` is exact in f32 (f16/tf32 give <=22 product significand bits, bf16 <=16, f32 holds
+    24 -> no rounding on the multiply), and both forms on the same Blackwell chip add the exact products
+    in the same wide fixed-point accumulator (F=25 fractional bits) with a single normalize -> same
+    bits. NVIDIA documents none of this; it is corroborated by two reverse-engineered bit-accurate
+    tensor-core models (arXiv 2511.10909 map both HMMA and UTCHMMA to FDA(F=25); arXiv 2512.07004 find
+    B200 == H100/H200 behavior, tensor cores NOT IEEE-754) and by our GB300 corpus (v2 and v5 land in
+    one bit class for f16/bf16/tf32). fp8 is the EXCEPTION and is kept conservative below: fp8
+    accumulation runs in limited precision with a periodic promote-to-f32 (Triton `max_num_imprecise_acc`
+    + a fp8-specific block ordering) that need not match across the two lowerings, so fp8 v2 != v5.
+
+    Note (dtype-relative): a native tcgen05 GEMM does not encode the specific operand dtype (``.kind::f16``
+    covers f16 AND bf16; the inputs are untyped ``.b16``), so the family cannot tell f16 from bf16 for
+    v5. The token is therefore dtype-RELATIVE: f16 and bf16 share the "f16" family. This is sound for
+    how the checker is used (the autotuner compares configs of ONE kernel = one fixed dtype), but two
+    DIFFERENT-dtype GEMMs would share a token."""
     if opcode == "tcgen05":
-        keep = sorted(m for m in mods if m.startswith(".kind::") or m.startswith(".cta_group::"))
-        return "tcgen05|" + ",".join(keep)
-    k = _k_of(mods)
+        kind = next((m[len(".kind::"):] for m in mods if m.startswith(".kind::")), "?")
+        if kind == "f8f6f4":  # fp8: v2 != v5 -> keep the native tcgen05 form so it never merges into matmul|
+            keep = sorted(m for m in mods if m.startswith(".kind::") or m.startswith(".cta_group::"))
+            return "tcgen05|" + ",".join(keep)
+        cta = next((m[len(".cta_group::"):] for m in mods if m.startswith(".cta_group::")), "1")
+        return f"matmul|{kind}|cta{cta}"
     dtypes = [m for m in mods if m in _MMA_DTYPES]
-    return f"{opcode}|k{k}|{','.join(dtypes)}"
+    if any(d in _FP8_DTYPES for d in dtypes):  # native fp8 (wgmma / mma.sync): keep the conservative form
+        k = _k_of(mods)
+        return f"{opcode}|k{k}|{','.join(dtypes)}"
+    cta = next((m[len(".cta_group::"):] for m in mods if m.startswith(".cta_group::")), "1")
+    return f"matmul|{_dtype_family(dtypes)}|cta{cta}"
 
 
 def _imm(operand):
@@ -109,11 +164,12 @@ def _fp_epi_counts(func):
     flips fma <-> mul+add in the epilogue, and the compiler can emit the SAME TOTAL count either way
     (measured on gemm_bias_relu_fp_fusion: 16 fma fused vs 16 add/mul unfused) — so a single lumped
     count collides and over-merges (fma is single-rounded, mul+add double-rounded -> different bits).
-    Keeping fma apart splits fp_fusion on/off. Both scale with the MMA tile count, so the GCD-reduced
-    ratio still cancels proportional M/N tiling."""
+    Keeping fma apart splits fp_fusion on/off. Both COUNTS scale with the M/N tile (elements per
+    thread), so the fence records only their PRESENCE, not the count (a count over-splits equivalent
+    re-tilings — see :func:`_mma_fence`)."""
     fma, addmul = 0, 0
     for inst in linearize(func):
-        if not (inst.modifiers and inst.modifiers[-1] in _FP_EPI_WIDTHS):
+        if not (inst.modifiers and any(m in _FP_EPI_WIDTHS for m in inst.modifiers)):
             continue
         if inst.opcode == "fma":
             fma += 1
@@ -126,9 +182,14 @@ def _mma_fence(func):
     """Tiling-invariant fence for an entry's MMA ops, or ``None`` if the entry has no MMA.
 
     Returns a hashable tuple. Two entries with equal fences differ only in a bit-IRRELEVANT tiling
-    choice; any bit-relevant difference (K split, dtype, flag, or a non-proportional op-count change)
-    yields a distinct fence. fp8 falls back to the raw per-token count map + raw fp count (strictly
-    more splitting) because its imprecise-acc flush cadence is invisible to the reduced ratio."""
+    choice; any bit-relevant difference (K split, dtype, flag, enable_fp_fusion) yields a distinct
+    fence. The f32 epilogue rides as PRESENCE ``(has_fma, has_addmul)`` — NOT a count: the op count
+    scales with the M/N tile (elements per thread) while tcgen05's mma count does not, so a count
+    (even GCD-reduced) cannot cancel the tile scaling and over-splits equivalent re-tilings. The
+    bit-relevant K regrouping (BLOCK_K, num_splits) rides the token / caller's ``loops=`` /
+    ``splits=`` instead of the op count. fp8 still falls back to the raw per-token count map + raw fp
+    count (strictly more splitting) because its imprecise-acc flush cadence is invisible even to
+    presence."""
     insts = [i for i in linearize(func) if _is_mma(i)]
     if not insts:
         return None
@@ -143,6 +204,22 @@ def _mma_fence(func):
         for t in tokens:
             counts[t] = counts.get(t, 0) + 1
         return ("mma-fp8", tuple(sorted(counts.items())), flags, (fma, addmul))
-    n = len(insts)
-    g = gcd(gcd(n, fma), addmul) or 1  # GCD over all three -> proportional M/N tiling cancels
-    return ("mma", frozenset(tokens), flags, (n // g, fma // g, addmul // g))
+    return ("mma", frozenset(tokens), flags, (int(fma > 0), int(addmul > 0)))
+
+
+def mma_token_counts(func):
+    """Sorted ``(token, count)`` of the entry's tensor-core matmuls — how many hardware accumulate
+    passes each :func:`_mma_token` contributes.
+
+    :func:`_mma_fence` deliberately DROPS this count for the non-fp8 families, because for a
+    PROVEN-pure tensor-core fold a re-tiling issues a different number of MMA instructions over the
+    same dot products (bit-free). That licence does not exist when the fold is NOT proven pure: there
+    the count is the only PTX witness of how many products reach an accumulator, i.e. of the matmul's
+    REDUCTION EXTENT (attention's head dim, a GEMM's K). Callers on the fail-closed side use this;
+    the fence itself must not, or it would over-split every equivalent re-tiling."""
+    counts = {}
+    for inst in linearize(func):
+        if _is_mma(inst):
+            t = _mma_token(inst.opcode, inst.modifiers)
+            counts[t] = counts.get(t, 0) + 1
+    return tuple(sorted(counts.items()))

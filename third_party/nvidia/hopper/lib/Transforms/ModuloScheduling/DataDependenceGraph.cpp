@@ -40,15 +40,16 @@ unsigned DataDependenceGraph::addNode(Operation *op,
 }
 
 void DataDependenceGraph::addEdge(unsigned src, unsigned dst, int latency,
-                                  unsigned distance) {
-  edges.push_back(DDGEdge{src, dst, latency, distance});
+                                  unsigned distance, unsigned srcResultIdx) {
+  edges.push_back(DDGEdge{src, dst, latency, distance, srcResultIdx});
   nodes[src].succs.push_back(dst);
   nodes[dst].preds.push_back(src);
 }
 
 DataDependenceGraph DataDependenceGraph::build(
     scf::ForOp loop, const LatencyModel &model,
-    const llvm::DenseMap<Operation *, DataPartitionInfo> &partition) {
+    const llvm::DenseMap<Operation *, DataPartitionInfo> &partition,
+    llvm::StringRef scheduleAlgo) {
   DataDependenceGraph ddg;
 
   // Phase 1: Create nodes for every op in the loop body (except terminator).
@@ -60,13 +61,14 @@ DataDependenceGraph DataDependenceGraph::build(
     // is the inner loop's total execution time (II × trip_count), and
     // its pipeline is NONE (handles its own internal pipelining).
     if (auto innerLoop = dyn_cast<scf::ForOp>(op)) {
-      auto innerDDG = DataDependenceGraph::build(innerLoop, model, partition);
+      auto innerDDG =
+          DataDependenceGraph::build(innerLoop, model, partition, scheduleAlgo);
       // Pass A.5: the inner MMA may be partitioned; apply the split before
       // scheduling so the super-node's innerII is the partitioned II, not the
       // unpartitioned one (which would dilute the outer loop's cost and could
       // hide a variant that only schedules once the inner MMA is split).
       innerDDG.applyDataPartition(partition);
-      auto innerSched = runModuloScheduling(innerDDG);
+      auto innerSched = runModuloScheduling(innerDDG, scheduleAlgo);
 
       DDGNode node;
       node.op = &op;
@@ -150,7 +152,8 @@ DataDependenceGraph DataDependenceGraph::build(
       // a single `latency` that captures full delivery, and edges just
       // propagate it.
       int edgeLatency = ddg.nodes[srcIdx].latency;
-      ddg.addEdge(srcIdx, node.idx, edgeLatency, /*distance=*/0);
+      unsigned srcResultIdx = cast<OpResult>(operand).getResultNumber();
+      ddg.addEdge(srcIdx, node.idx, edgeLatency, /*distance=*/0, srcResultIdx);
     }
   }
 
@@ -235,8 +238,9 @@ DataDependenceGraph DataDependenceGraph::build(
       if (srcNode.pipeline == HWPipeline::TC &&
           dstNode.pipeline == HWPipeline::TC)
         backEdgeLat = std::max(pipelineOccupancy(srcNode), 1);
+      unsigned srcResultIdx = cast<OpResult>(yieldVal).getResultNumber();
       ddg.addEdge(srcIdx, userIt->second, backEdgeLat,
-                  /*distance=*/1);
+                  /*distance=*/1, srcResultIdx);
     }
   }
 

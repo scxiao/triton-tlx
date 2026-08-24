@@ -153,13 +153,21 @@ static PyObject *getDeviceProperties(PyObject *self, PyObject *args) {
   int sm_clock_rate;
   int mem_clock_rate;
   int mem_bus_width;
+  int major;
+  int minor;
+
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGetAttribute(
+      &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGetAttribute(
+      &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
 
   // XXX: remove attribute enum def once latest cuda.h is in use
   int CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK = 150;
-  if (CUDA_SUCCESS !=
-      cuDeviceGetAttribute(
-          &max_shared_mem,
-          CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, device)) {
+  if (major == 10 && minor == 7) {
+    CUDA_CHECK_AND_RETURN_NULL(cuDeviceGetAttribute(
+        &max_shared_mem,
+        CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, device));
+  } else {
     CUDA_CHECK_AND_RETURN_NULL(cuDeviceGetAttribute(
         &max_shared_mem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
         device));
@@ -493,18 +501,19 @@ static PyObject *setPrintfFifoSize(PyObject *self, PyObject *args) {
 }
 
 static PyObject *PyCUtensorMap_alloc(PyTypeObject *type, Py_ssize_t n_items) {
-  PyCUtensorMapObject *self = NULL;
+  PyObject *self = NULL;
   void *mem = NULL;
   size_t size = type->tp_basicsize;
 
-  if (posix_memalign(&mem, 128, size) != 0) {
+  if (posix_memalign(&mem, alignof(CUtensorMap), size) != 0) {
     PyErr_NoMemory();
     return NULL;
   }
 
-  self = (PyCUtensorMapObject *)mem;
+  memset(mem, 0, size);
+  self = (PyObject *)mem;
   PyObject_INIT(self, type);
-  return (PyObject *)self;
+  return self;
 }
 
 static void PyCUtensorMap_dealloc(PyObject *self) {
@@ -2263,12 +2272,13 @@ typedef struct {
   unsigned profile_scratch_align;
   PyObject *allocator;         /* _allocation._allocator (ContextVar) */
   PyObject *profile_allocator; /* _allocation._profile_allocator (wrapper) */
-  /* TMA descriptor storage (128-byte aligned) */
+  /* TMA descriptor storage */
   int num_tma_descs;
   int tma_slot_for_arg[TD_MAX_KERNEL_ARGS]; /* -1 if not TMA, else tma_descs
                                                index */
   TMASlotMeta tma_meta[TD_MAX_TMA_DESCS];
-  CUtensorMap tma_descs[TD_MAX_TMA_DESCS] __attribute__((aligned(128)));
+  /* TritonDispatcherType.tp_alloc must honor this member's alignment. */
+  _Alignas(alignof(CUtensorMap)) CUtensorMap tma_descs[TD_MAX_TMA_DESCS];
   /* Converged launch: when set, this kernel launches through the shared core
    * triton_launch_kernel() instead of the dispatcher's own cuLaunchKernelEx.
    * Enabled for the common non-TMA, non multi-dim-cluster case (see
@@ -2612,10 +2622,22 @@ static inline int td_convert_args(TritonDispatcher *self,
   return 0;
 }
 
+/* Read one grid dimension from a Python int, normalizing an empty grid to 0.
+ * triton_launch_kernel() treats a non-positive grid as a no-op launch, so the
+ * dispatcher must too: casting a negative dimension straight to unsigned would
+ * wrap it into a huge gridDim that cuLaunchKernelEx rejects with
+ * CUDA_ERROR_INVALID_VALUE. */
+static inline unsigned td_grid_dim(PyObject *obj) {
+  long v = PyLong_AsLong(obj);
+  return v > 0 ? (unsigned)v : 0u;
+}
+
 /* Relaunch with pre-built attrs (cuLaunchKernelEx wrapper) */
 static inline CUresult td_relaunch(TritonDispatcher *d, unsigned gx,
                                    unsigned gy, unsigned gz, CUstream stream) {
-  if (gx * gy * gz == 0)
+  /* Per-dimension, not gx * gy * gz: the product overflows to 0 for legal
+   * grids such as (1 << 26, 64, 1), which would silently skip the launch. */
+  if (gx == 0 || gy == 0 || gz == 0)
     return CUDA_SUCCESS;
   if (d->use_core_launch) {
     /* Converged path: launch through the shared core in launch.h. */
@@ -2954,12 +2976,12 @@ static PyObject *TritonDispatcher_vectorcall(PyObject *callable,
   if (PyErr_Occurred())
     return NULL;
 
+  if (gx_l <= 0 || gy_l <= 0 || gz_l <= 0)
+    Py_RETURN_NONE;
+
   unsigned gx = (unsigned)gx_l;
   unsigned gy = (unsigned)gy_l;
   unsigned gz = (unsigned)gz_l;
-
-  if (gx * gy * gz == 0)
-    Py_RETURN_NONE;
 
   CUstream stream = (CUstream)(uintptr_t)PyLong_AsUnsignedLongLong(args[3]);
 
@@ -3061,6 +3083,8 @@ static PyTypeObject TritonDispatcherType = {
     .tp_call = PyVectorcall_Call,
     .tp_new = TritonDispatcher_new,
     .tp_dealloc = TritonDispatcher_dealloc,
+    .tp_alloc = PyCUtensorMap_alloc,
+    .tp_free = PyCUtensorMap_free,
     .tp_doc = "Full C dispatcher for Triton JIT kernel launch (vectorcall).",
 };
 
@@ -3105,12 +3129,9 @@ static PyObject *JITRunner_new(PyTypeObject *type, PyObject *args,
   Py_INCREF(dispatcher_obj);
 
   Py_ssize_t gs = PyTuple_Size(grid_tuple);
-  self->grid[0] =
-      (gs > 0) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
-  self->grid[1] =
-      (gs > 1) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
-  self->grid[2] =
-      (gs > 2) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
+  self->grid[0] = (gs > 0) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
+  self->grid[1] = (gs > 1) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
+  self->grid[2] = (gs > 2) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
 
   self->get_stream_fn = get_stream_fn;
   Py_INCREF(get_stream_fn);
@@ -3373,12 +3394,9 @@ static PyObject *fast_subscript(PyObject *self, PyObject *grid) {
     pr->dispatcher = (TritonDispatcher *)disp;
     Py_INCREF(disp);
     Py_ssize_t gs = PyTuple_Size(grid_tuple);
-    pr->grid[0] =
-        (gs > 0) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
-    pr->grid[1] =
-        (gs > 1) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
-    pr->grid[2] =
-        (gs > 2) ? (unsigned)PyLong_AsLong(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
+    pr->grid[0] = (gs > 0) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 0)) : 1;
+    pr->grid[1] = (gs > 1) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 1)) : 1;
+    pr->grid[2] = (gs > 2) ? td_grid_dim(PyTuple_GET_ITEM(grid_tuple, 2)) : 1;
 
     pr->get_stream_fn = gsf;
     Py_INCREF(gsf);

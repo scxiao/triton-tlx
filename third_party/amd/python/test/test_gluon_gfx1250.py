@@ -13,6 +13,7 @@ from triton.tools.mxfp import MXFP4Tensor, MXScaleTensor
 from triton.experimental import gluon
 import triton.experimental.gluon.language as ttgl
 from triton.experimental.gluon.language.amd.gfx1250 import get_wmma_scale_layout, PartitionedSharedLayout, _valid_dtype_combinations
+from triton._C.libtriton.gluon_ir import make_cga_layout
 
 
 @gluon.jit
@@ -393,7 +394,8 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
                                 stride_bk, stride_bn,  #
                                 stride_cm, stride_cn,  #
                                 BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr, BLOCK_K: ttgl.constexpr,  #
-                                NUM_BUFFERS: ttgl.constexpr, USE_TDM: ttgl.constexpr, IS_B_K_CONTIG: ttgl.constexpr):
+                                NUM_BUFFERS: ttgl.constexpr, USE_TDM: ttgl.constexpr, IS_B_K_CONTIG: ttgl.constexpr,
+                                RESOLVE_PARTITION_CONFLICTS: ttgl.constexpr):
     a_dtype: ttgl.constexpr = a_ptr.type.element_ty
     b_dtype: ttgl.constexpr = b_ptr.type.element_ty
     ttgl.static_assert(a_dtype.is_fp16() or a_dtype.is_bf16(), "Only fp16/bf16 supported for A")
@@ -401,19 +403,24 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
     ttgl.static_assert(NUM_BUFFERS >= 2, "NUM_BUFFERS must be at least 2")
 
     BLOCKED_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
+
+    padded_a: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0])
     if IS_B_K_CONTIG:
-        BLOCKED_LAYOUT_B: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
+        padded_b: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0])
     else:
-        BLOCKED_LAYOUT_B: ttgl.constexpr = ttgl.BlockedLayout([8, 1], [8, 4], [1, 4], [0, 1])
-    WMMA_LAYOUT: ttgl.constexpr = ttgl.amd.AMDWMMALayout(3, True, [[0, 1], [1, 0]], [], [16, 16, 32])
-    SHARED_LAYOUT_A: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_M, BLOCK_K],
-                                                                                [1, 0])
-    if IS_B_K_CONTIG:
-        SHARED_LAYOUT_B: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_N, 8]], [BLOCK_K, BLOCK_N],
-                                                                                    [1, 0])
+        padded_b: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_N, 8]], [BLOCK_K, BLOCK_N], [1, 0])
+
+    if RESOLVE_PARTITION_CONFLICTS:
+        # The padded layouts above are reinterpreted as per-piece sublayouts here.
+        _DOT_LAYOUTS: ttgl.constexpr = ttgl.amd.gfx1250.make_partitioned_dot_layouts(
+            BLOCK_M, BLOCK_N, padded_a, padded_b, 4, [16, 16, 32], a_transposed=False, b_transposed=IS_B_K_CONTIG)
     else:
-        SHARED_LAYOUT_B: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[BLOCK_K, 8]], [BLOCK_K, BLOCK_N],
-                                                                                    [0, 1])
+        _DOT_LAYOUTS: ttgl.constexpr = (padded_a, padded_b,
+                                        ttgl.amd.AMDWMMALayout(3, True, [[0, 1], [1, 0]], [], [16, 16, 32]))
+    SHARED_LAYOUT_A: ttgl.constexpr = _DOT_LAYOUTS[0]
+    SHARED_LAYOUT_B: ttgl.constexpr = _DOT_LAYOUTS[1]
+    WMMA_LAYOUT: ttgl.constexpr = _DOT_LAYOUTS[2]
+
     OPERAND_LAYOUT_A: ttgl.constexpr = ttgl.DotOperandLayout(0, WMMA_LAYOUT, 8)
     OPERAND_LAYOUT_B: ttgl.constexpr = ttgl.DotOperandLayout(1, WMMA_LAYOUT, 8)
 
@@ -429,21 +436,38 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
         strides=(stride_am, stride_ak),  #
         block_shape=(BLOCK_M, BLOCK_K),  #
         layout=SHARED_LAYOUT_A)
-    b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(  #
-        base=b_ptr + pid_n * BLOCK_N * stride_bn,  #
-        shape=(K, N),  #
-        strides=(stride_bk, stride_bn),  #
-        block_shape=(BLOCK_K, BLOCK_N),  #
-        layout=SHARED_LAYOUT_B)
+    if IS_B_K_CONTIG:
+        # TDM always needs the most-minor dimension to be contiguous, so for K-contiguous B we
+        # describe the tile as (BLOCK_N, BLOCK_K) and permute it before the dot.
+        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(  #
+            base=b_ptr + pid_n * BLOCK_N * stride_bn,  #
+            shape=(N, K),  #
+            strides=(stride_bn, stride_bk),  #
+            block_shape=(BLOCK_N, BLOCK_K),  #
+            layout=SHARED_LAYOUT_B)
+    else:
+        b_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(  #
+            base=b_ptr + pid_n * BLOCK_N * stride_bn,  #
+            shape=(K, N),  #
+            strides=(stride_bk, stride_bn),  #
+            block_shape=(BLOCK_K, BLOCK_N),  #
+            layout=SHARED_LAYOUT_B)
 
     # Pointers for AsyncCopy
     offs_ak = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))
     offs_am = (pid_m * BLOCK_M + ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))) % M
     a_ptrs = a_ptr + offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
 
-    offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT_B))
-    offs_bn = (pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT_B))) % N
-    b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+    if IS_B_K_CONTIG:
+        # Tile is [BLOCK_N, BLOCK_K]: N along rows, K along cols (contiguous).
+        offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))
+        offs_bn = (pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))) % N
+        b_ptrs = b_ptr + offs_bn[:, None] * stride_bn + offs_bk[None, :] * stride_bk
+    else:
+        # Tile is [BLOCK_K, BLOCK_N]: K along rows, N along cols (contiguous).
+        offs_bk = ttgl.arange(0, BLOCK_K, layout=ttgl.SliceLayout(1, BLOCKED_LAYOUT))
+        offs_bn = (pid_n * BLOCK_N + ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, BLOCKED_LAYOUT))) % N
+        b_ptrs = b_ptr + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
 
     a_buffer = ttgl.allocate_shared_memory(a_desc.dtype, shape=[NUM_BUFFERS] + a_desc.block_shape, layout=a_desc.layout)
     b_buffer = ttgl.allocate_shared_memory(b_desc.dtype, shape=[NUM_BUFFERS] + b_desc.block_shape, layout=b_desc.layout)
@@ -456,14 +480,21 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
         if USE_TDM:
             ttgl.amd.gfx1250.tdm.async_load(a_desc, [0, load_idx * BLOCK_K],  #
                                             a_buffer.index(load_idx % NUM_BUFFERS))
-            ttgl.amd.gfx1250.tdm.async_load(b_desc, [load_idx * BLOCK_K, 0],  #
-                                            b_buffer.index(load_idx % NUM_BUFFERS))
+            if IS_B_K_CONTIG:
+                ttgl.amd.gfx1250.tdm.async_load(b_desc, [0, load_idx * BLOCK_K],  #
+                                                b_buffer.index(load_idx % NUM_BUFFERS))
+            else:
+                ttgl.amd.gfx1250.tdm.async_load(b_desc, [load_idx * BLOCK_K, 0],  #
+                                                b_buffer.index(load_idx % NUM_BUFFERS))
         else:
             mask_a = offs_ak[None, :] < K - load_idx * BLOCK_K
             ttgl.amd.gfx1250.async_copy.global_to_shared(a_buffer.index(load_idx % NUM_BUFFERS), a_ptrs, mask_a,
                                                          other=0.0)
 
-            mask_b = offs_bk[:, None] < K - load_idx * BLOCK_K
+            if IS_B_K_CONTIG:
+                mask_b = offs_bk[None, :] < K - load_idx * BLOCK_K
+            else:
+                mask_b = offs_bk[:, None] < K - load_idx * BLOCK_K
             ttgl.amd.gfx1250.async_copy.global_to_shared(b_buffer.index(load_idx % NUM_BUFFERS), b_ptrs, mask_b,
                                                          other=0.0)
             ttgl.amd.gfx1250.async_copy.commit_group()
@@ -476,14 +507,21 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
         if USE_TDM:
             ttgl.amd.gfx1250.tdm.async_load(a_desc, [0, load_idx * BLOCK_K],  #
                                             a_buffer.index(load_idx % NUM_BUFFERS))
-            ttgl.amd.gfx1250.tdm.async_load(b_desc, [load_idx * BLOCK_K, 0],  #
-                                            b_buffer.index(load_idx % NUM_BUFFERS))
+            if IS_B_K_CONTIG:
+                ttgl.amd.gfx1250.tdm.async_load(b_desc, [0, load_idx * BLOCK_K],  #
+                                                b_buffer.index(load_idx % NUM_BUFFERS))
+            else:
+                ttgl.amd.gfx1250.tdm.async_load(b_desc, [load_idx * BLOCK_K, 0],  #
+                                                b_buffer.index(load_idx % NUM_BUFFERS))
         else:
             mask_a = offs_ak[None, :] < K - load_idx * BLOCK_K
             ttgl.amd.gfx1250.async_copy.global_to_shared(a_buffer.index(load_idx % NUM_BUFFERS), a_ptrs, mask_a,
                                                          other=0.0)
 
-            mask_b = offs_bk[:, None] < K - load_idx * BLOCK_K
+            if IS_B_K_CONTIG:
+                mask_b = offs_bk[None, :] < K - load_idx * BLOCK_K
+            else:
+                mask_b = offs_bk[:, None] < K - load_idx * BLOCK_K
             ttgl.amd.gfx1250.async_copy.global_to_shared(b_buffer.index(load_idx % NUM_BUFFERS), b_ptrs, mask_b,
                                                          other=0.0)
             ttgl.amd.gfx1250.async_copy.commit_group()
@@ -498,7 +536,10 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
             ttgl.amd.gfx1250.async_copy.wait_group((NUM_BUFFERS - 1))
 
         a = a_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_A)
-        b = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)
+        if IS_B_K_CONTIG:
+            b = b_buffer.index(wmma_idx % NUM_BUFFERS).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+        else:
+            b = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)
         accumulator = ttgl.amd.gfx1250.wmma(a, b, accumulator)
         wmma_idx += 1
 
@@ -509,7 +550,10 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
             ttgl.amd.gfx1250.async_copy.wait_group((NUM_BUFFERS - 2 - i))
 
         a = a_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_A)
-        b = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)
+        if IS_B_K_CONTIG:
+            b = b_buffer.index(wmma_idx % NUM_BUFFERS).permute([1, 0]).load(layout=OPERAND_LAYOUT_B)
+        else:
+            b = b_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_B)
         accumulator = ttgl.amd.gfx1250.wmma(a, b, accumulator)
         wmma_idx += 1
 
@@ -523,26 +567,42 @@ def gemm_async_pipelined_kernel(a_ptr, b_ptr, c_ptr,  #
 @pytest.mark.parametrize("BLOCK_M,BLOCK_N,BLOCK_K", [(m, n, k) for (m, n) in [(32, 32), (64, 64)] \
                                                                for k in [32, 64]])
 @pytest.mark.parametrize("NUM_BUFFERS", [2, 4])
-@pytest.mark.parametrize("IS_B_K_CONTIG", [True, False])
 @pytest.mark.parametrize("ASYNC_LOAD_TYPE", ["ASYNC_COPY", "TDM"])
-def test_compile_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, IS_B_K_CONTIG, ASYNC_LOAD_TYPE):
+@pytest.mark.parametrize("B_K_CONTIG", [True, False])
+@pytest.mark.parametrize("RESOLVE_PARTITION_CONFLICTS", [True, False])
+def test_compile_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, ASYNC_LOAD_TYPE, B_K_CONTIG,
+                                      RESOLVE_PARTITION_CONFLICTS):
+    if RESOLVE_PARTITION_CONFLICTS:
+        if ASYNC_LOAD_TYPE == "ASYNC_COPY":
+            pytest.skip("AsyncCopy is not supported with partition shared layouts")
+        # The kernel uses num_warps=4 and instr_shape=[16, 16, 32], which gives
+        # WARP_TILES_M=4 and WARP_TILES_N=2 (see make_partitioned_dot_layouts).
+        # The minimum partitionable tile size is WARP_TILES_{M,N} * instr_shape[{0,1}].
+        min_block_m = 4 * 16
+        min_block_n = 2 * 16
+        if BLOCK_M < min_block_m or BLOCK_N < min_block_n:
+            pytest.skip(
+                f"Minimal block shape for partition conflicts resolution is ({min_block_m}, {min_block_n}) along (M, N)"
+            )
+
     # Inner strides need to be constexpr (1) to get contiguity. Note the compiler frontend does the same for normal dispatches
     signature = {
         "a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp32",  #
         "M": "i32", "N": "i32", "K": "i32",  #
         "stride_am": "i32", "stride_ak": "constexpr",  #
-        "stride_bk": "constexpr", "stride_bn": "constexpr",  #
+        "stride_bk": "constexpr" if B_K_CONTIG else "i32", "stride_bn": "i32" if B_K_CONTIG else "constexpr",  #
         "stride_cm": "i32", "stride_cn": "constexpr",  #
         "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr",  #
-        "NUM_BUFFERS": "constexpr", "USE_TDM": "constexpr", "IS_B_K_CONTIG": "constexpr"
+        "NUM_BUFFERS": "constexpr", "USE_TDM": "constexpr", "IS_B_K_CONTIG": "constexpr", "RESOLVE_PARTITION_CONFLICTS":
+        "constexpr"
     }
 
     constexprs = {
-        "stride_ak": 1, "stride_cn": 1, "BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K, "NUM_BUFFERS":
-        NUM_BUFFERS, "USE_TDM": ASYNC_LOAD_TYPE == "TDM", "IS_B_K_CONTIG": IS_B_K_CONTIG
+        "stride_ak": 1, ("stride_bk" if B_K_CONTIG else "stride_bn"): 1, "stride_cn": 1,  #
+        "BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K, "NUM_BUFFERS": NUM_BUFFERS,  #
+        "USE_TDM": ASYNC_LOAD_TYPE == "TDM", "IS_B_K_CONTIG": B_K_CONTIG,  #
+        "RESOLVE_PARTITION_CONFLICTS": RESOLVE_PARTITION_CONFLICTS
     }
-    constexprs["stride_bn"] = BLOCK_N if not IS_B_K_CONTIG else 1
-    constexprs["stride_bk"] = BLOCK_K if IS_B_K_CONTIG else 1
 
     fn = gemm_async_pipelined_kernel
 
@@ -553,6 +613,7 @@ def test_compile_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, IS
 
     k = triton.compile(src=gluon._runtime.GluonASTSource(fn, signature, constexprs, attrs=attrs),
                        target=GPUTarget("hip", 'gfx1250', 32))
+    ttgir = k.asm["ttgir"]
     amdgcn = k.asm["amdgcn"]
 
     assert re.search("v_wmma_f32_16x16x32_f16", amdgcn)
@@ -563,11 +624,14 @@ def test_compile_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, IS
         assert len(re.findall("tensor_load_to_lds", amdgcn)) == NUM_BUFFERS * 2
     else:
         copy_instr_for_A = BLOCK_M // 4 // 4
-        copy_isntr_for_B = (BLOCK_K if IS_B_K_CONTIG else BLOCK_N) // 4 // 4
+        b_rows = BLOCK_N if B_K_CONTIG else BLOCK_K
+        copy_isntr_for_B = b_rows // 4 // 4
         copy_instr_per_iter = copy_instr_for_A + copy_isntr_for_B
+        assert len(re.findall("ttg.async_copy_global_to_local", ttgir)) == NUM_BUFFERS * 2
         for cnt in range(NUM_BUFFERS - 1, -1, -1):
             assert re.search(f"s_wait_asynccnt 0x{(cnt * copy_instr_per_iter):x}", amdgcn)
         # Each instruction loads 4 rows per warp and we have 4 warps (see BlockedLayout in test)
+        # Only treat this as a lower bound because LLVM might unroll the loop
         assert len(re.findall("global_load_async_to_lds", amdgcn)) >= NUM_BUFFERS * copy_instr_per_iter
 
 
@@ -575,23 +639,42 @@ def test_compile_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, IS
                                                                for k in [32, 64]])
 @pytest.mark.parametrize("NUM_BUFFERS", [2, 4])
 @pytest.mark.parametrize("M,N,K", [(256, 256, 512), (240, 240, 496), (250, 250, 510)])
-@pytest.mark.parametrize("IS_B_K_CONTIG", [True, False])
 @pytest.mark.parametrize("ASYNC_LOAD_TYPE", ["ASYNC_COPY", "TDM"])
-def test_runtime_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, M, N, K, IS_B_K_CONTIG, ASYNC_LOAD_TYPE):
+@pytest.mark.parametrize("B_K_CONTIG", [True, False])
+@pytest.mark.parametrize("RESOLVE_PARTITION_CONFLICTS", [True, False])
+def test_runtime_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, M, N, K, ASYNC_LOAD_TYPE, B_K_CONTIG,
+                                      RESOLVE_PARTITION_CONFLICTS):
     if triton.cdiv(K, BLOCK_K) < NUM_BUFFERS:
         pytest.skip("Skip tests where K/BLOCK_K < NUM_BUFFERS")
 
     if ASYNC_LOAD_TYPE == "ASYNC_COPY" and any([x % 16 != 0 for x in [M, N, K]]):
         pytest.skip("AsyncCopy tests need divisibility==16 to get vectorization information")
 
+    if RESOLVE_PARTITION_CONFLICTS:
+        if ASYNC_LOAD_TYPE == "ASYNC_COPY":
+            pytest.skip("AsyncCopy is not supported with partition shared layouts")
+        # The kernel uses num_warps=4 and instr_shape=[16, 16, 32], which gives
+        # WARP_TILES_M=4 and WARP_TILES_N=2 (see make_partitioned_dot_layouts).
+        # The minimum partitionable tile size is WARP_TILES_{M,N} * instr_shape[{0,1}].
+        min_block_m = 4 * 16
+        min_block_n = 2 * 16
+        if BLOCK_M < min_block_m or BLOCK_N < min_block_n:
+            pytest.skip(
+                f"Minimal block shape for partition conflicts resolution is ({min_block_m}, {min_block_n}) along (M, N)"
+            )
+
     torch.manual_seed(42)
 
     a = torch.randn((M, K), dtype=torch.float16)
-    b = torch.randn((K, N), dtype=torch.float16)
+    if B_K_CONTIG:
+        # Allocate as (N, K) and transpose so that the K dimension is the contiguous one.
+        b = torch.randn((N, K), dtype=torch.float16).t()
+    else:
+        b = torch.randn((K, N), dtype=torch.float16)
     c = torch.zeros((M, N), dtype=torch.float32)
 
     a_device = a.cuda()
-    b_device = b.cuda() if IS_B_K_CONTIG else b.data.T.contiguous().T.cuda()
+    b_device = b.cuda() if B_K_CONTIG else b.data.T.contiguous().T.cuda()
     c_device = c.cuda()
 
     stride_am, stride_ak = a_device.stride(0), a_device.stride(1)
@@ -606,7 +689,8 @@ def test_runtime_gemm_async_pipelined(BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, M,
         stride_bk, stride_bn,  #
         stride_cm, stride_cn,  #
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,  #
-        NUM_BUFFERS=NUM_BUFFERS, USE_TDM=ASYNC_LOAD_TYPE == "TDM", IS_B_K_CONTIG=IS_B_K_CONTIG)
+        NUM_BUFFERS=NUM_BUFFERS, USE_TDM=ASYNC_LOAD_TYPE == "TDM", IS_B_K_CONTIG=B_K_CONTIG,
+        RESOLVE_PARTITION_CONFLICTS=RESOLVE_PARTITION_CONFLICTS)
 
     c_triton = c_device.cpu()
     c_torch = a.to(torch.float32) @ b.to(torch.float32)
@@ -1832,9 +1916,7 @@ def tensor_descriptor_load_store_nd_kernel_host_tdm(out_desc, inp_desc):
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
-def _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, SHARED_LAYOUT, ROW_MAJOR):
-    if not ROW_MAJOR and TDM_TYPE == "HOST_TDM":
-        pytest.skip("NYI: Host TDM does not support non-row major layouts")
+def _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, SHARED_LAYOUT):
     """Utility function to run TDM load/store tests with a given shared layout."""
     alloc_shape = [1, 1, 3, 7, INNER_BLOCK][-ndim:]
 
@@ -1842,10 +1924,6 @@ def _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYP
     inp = to_triton(numpy_random(alloc_shape, dtype_str), device="cpu", dst_type=dtype_str)
     inp.data = inp.data[..., :INNER_BLOCK - 3]
     out = inp.new_empty(BLOCK_SHAPE)
-
-    if ndim > 1 and not ROW_MAJOR:
-        out = out.data.transpose(-2, -1).contiguous().transpose(-2, -1)
-        inp = inp.data.transpose(-2, -1).contiguous().transpose(-2, -1)
 
     inp = inp.cuda()
     out = out.cuda()
@@ -1881,23 +1959,19 @@ def _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYP
 @pytest.mark.parametrize("INNER_BLOCK", [4, 8, 16, 32, 64, 128])
 @pytest.mark.parametrize("dtype_str", sorted(set(float_dtypes + int_dtypes)))
 @pytest.mark.parametrize("TDM_TYPE", ["DEVICE_TDM", "HOST_TDM"])
-@pytest.mark.parametrize("ROW_MAJOR", [False, True])
-def test_tensor_descriptor_load_store_nd(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, ROW_MAJOR):
+def test_tensor_descriptor_load_store_nd(dtype_str, ndim, INNER_BLOCK, TDM_TYPE):
     """Test TDM load/store with swizzled shared layout."""
 
     order = [ndim - 1 - i for i in range(ndim)]
-    if ndim > 1 and not ROW_MAJOR:
-        order[0], order[1] = order[1], order[0]
     SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=order)
 
-    _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, SHARED_LAYOUT, ROW_MAJOR)
+    _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, TDM_TYPE, SHARED_LAYOUT)
 
 
 @pytest.mark.parametrize("ndim", [1, 2, 3, 4, 5])
 @pytest.mark.parametrize("INNER_BLOCK", [16, 64])
 @pytest.mark.parametrize("dtype_str", ["float16", "int32"])
-@pytest.mark.parametrize("ROW_MAJOR", [False, True])
-def test_tensor_descriptor_load_store_nd_with_padding(dtype_str, ndim, INNER_BLOCK, ROW_MAJOR):
+def test_tensor_descriptor_load_store_nd_with_padding(dtype_str, ndim, INNER_BLOCK):
     """Test TDM load/store with padded shared memory layout.
     TDM store only supports padding when:
     1. There is a single padding interval
@@ -1907,12 +1981,9 @@ def test_tensor_descriptor_load_store_nd_with_padding(dtype_str, ndim, INNER_BLO
     BLOCK_SHAPE = (2, 2, 4, 8, INNER_BLOCK)[-ndim:]
     order = [ndim - 1 - i for i in range(ndim)]
     padding = [INNER_BLOCK, 8]
-    if ndim > 1 and not ROW_MAJOR:
-        order[0], order[1] = order[1], order[0]
-        padding = [8, INNER_BLOCK]
     PADDED_LAYOUT: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([padding], BLOCK_SHAPE, order)
 
-    _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, "DEVICE_TDM", PADDED_LAYOUT, ROW_MAJOR)
+    _run_tensor_descriptor_load_store_test(dtype_str, ndim, INNER_BLOCK, "DEVICE_TDM", PADDED_LAYOUT)
 
 
 def test_tensor_descriptor_load_store_invalid_blocksize():
@@ -2941,6 +3012,15 @@ def test_ws_store_wait_load(XBLOCK):
     arange pattern.
     """
 
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
+
     @gluon.jit
     def ws_consumer(smem, ready_bar, done_bar, layout: ttgl.constexpr):
         ttgl.amd.gfx1250.mbarrier.wait(ready_bar, phase=0)
@@ -3002,6 +3082,15 @@ def test_ws_store_wait_load_loop(XBLOCK, NUM_ITERS):
     (executed by default warps) waits for done_bar, loads the accumulated result, and stores it to global memory.
     The test verifies that the output equals the expected arange pattern.
     """
+
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
 
     @gluon.jit
     def ws_consumer(smem, ready_bar, done_bar, empty_bar, XBLOCK: ttgl.constexpr, NUM_ITERS: ttgl.constexpr,
@@ -3082,6 +3171,15 @@ def test_runtime_ws_tensor_async_load_store_mbarrier(M, N, BLOCK_M, BLOCK_N, NUM
 
     The test verifies that the output matches the input, confirming that async load/store operations are correctly coordinated by mbarriers.
     """
+
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
 
     @gluon.jit
     def ws_producer(a_desc, a_buffer, bars, pid_n, idx_m, BLOCK_N: ttgl.constexpr, NUM_BUFFERS: ttgl.constexpr):
@@ -3165,6 +3263,15 @@ def test_runtime_ws_tensor_copy_mbarrier(M, N, BLOCK_M, BLOCK_N, NUM_BUFFERS, NU
 
     The test verifies that the output matches the input, confirming correct synchronization.
     """
+
+    import os
+    if os.environ.get("TRITON_INSTRUMENTATION_MODE") == "consan":
+        from triton.runtime._allocation import set_profile_allocator
+
+        def alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        set_profile_allocator(alloc_fn)
 
     @gluon.jit
     def ws_producer(a_desc, a_buffer, bars, pid_n, idx_m, BLOCK_N: ttgl.constexpr, NUM_BUFFERS: ttgl.constexpr):
@@ -3537,7 +3644,9 @@ def tdm_scatter_kernel(inp_ptr, out_ptr, dst_row_indices_ptr, M_out, N_out, stri
     dst_row_indices = ttgl.load(dst_row_indices_ptr + idx_offs)
 
     # Scatter the data to non-contiguous rows starting at DST_COL_OFFSET
-    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, DST_COL_OFFSET, smem)
+    out_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(out_desc, add_offsets=[0, DST_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
@@ -3782,7 +3891,8 @@ def tdm_scatter_multi_col_kernel(inp_ptr, out_ptr, dst_row_indices_ptr, M, N, st
     dst_row_indices = ttgl.load(dst_row_indices_ptr + pid_m * BLOCK_M + idx_offs, mask=idx_mask, other=M)
 
     col_offset = pid_n * BLOCK_N
-    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, col_offset, smem)
+    out_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(out_desc, add_offsets=[0, col_offset], clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
@@ -3842,7 +3952,9 @@ def _tdm_scatter_padded_kernel(inp_ptr, out_ptr, dst_row_indices_ptr, M_out, N_o
     idx_offs = ttgl.arange(0, NUM_INDICES, layout=IDX_LAYOUT)
     dst_row_indices = ttgl.load(dst_row_indices_ptr + idx_offs)
 
-    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, DST_COL_OFFSET, smem)
+    out_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(out_desc, add_offsets=[0, DST_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
@@ -3916,8 +4028,9 @@ def tdm_gather_kernel(inp_ptr, out_ptr, src_row_indices_ptr, M_inp, N_inp, strid
     idx_offs = ttgl.arange(0, NUM_INDICES, layout=IDX_LAYOUT)
     src_row_indices = ttgl.load(src_row_indices_ptr + idx_offs)
 
-    # Gather data from non-contiguous rows starting at SRC_COL_OFFSET
-    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, SRC_COL_OFFSET, smem)
+    inp_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(inp_desc, add_offsets=[0, SRC_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
     # Store gathered data to output using TDM
@@ -3925,6 +4038,28 @@ def tdm_gather_kernel(inp_ptr, out_ptr, src_row_indices_ptr, M_inp, N_inp, strid
                                                            block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
     ttgl.amd.gfx1250.tdm.async_store(out_desc, [0, 0], smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
+
+
+@gluon.jit
+def tdm_gather_multi_cta_kernel(inp_ptr, out_ptr, src_row_indices_ptr, M_inp, N_inp, stride_m, BLOCK_M: ttgl.constexpr,
+                                BLOCK_N: ttgl.constexpr, SRC_COL_OFFSET: ttgl.constexpr, SHARED_LAYOUT: ttgl.constexpr,
+                                BLOCK_LAYOUT: ttgl.constexpr, IDX_LAYOUT: ttgl.constexpr):
+    """Kernel that uses TDM gather with a multi-CTA shared-memory layout."""
+    smem = ttgl.allocate_shared_memory(inp_ptr.type.element_ty, (BLOCK_M, BLOCK_N), SHARED_LAYOUT)
+
+    inp_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=inp_ptr, shape=(M_inp, N_inp), strides=(stride_m, 1),
+                                                           block_shape=(BLOCK_M, BLOCK_N), layout=SHARED_LAYOUT)
+
+    idx_offs = ttgl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
+    src_row_indices = ttgl.load(src_row_indices_ptr + idx_offs)
+
+    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, smem)
+    ttgl.amd.gfx1250.tdm.async_wait(0)
+
+    gathered = smem.load(layout=BLOCK_LAYOUT)
+    offs_m = ttgl.arange(0, BLOCK_M, layout=ttgl.SliceLayout(1, BLOCK_LAYOUT))
+    offs_n = ttgl.arange(0, BLOCK_N, layout=ttgl.SliceLayout(0, BLOCK_LAYOUT))
+    ttgl.store(out_ptr + offs_m[:, None] * BLOCK_N + offs_n[None, :], gathered)
 
 
 @pytest.mark.parametrize("NUM_INDICES", [1, 2, 4, 8, 16])
@@ -3975,6 +4110,53 @@ def test_compile_tdm_gather(NUM_INDICES, BLOCK_M, BLOCK_N, dtype, index_dtype, s
     # Verify the gather uses tensor load to lds
     assert re.search("tensor_load_to_lds", amdgcn), "Expected tensor_load_to_lds instruction for TDM gather"
     assert re.search("s_wait_tensorcnt 0x0", amdgcn), "Expected s_wait_tensorcnt instruction"
+
+
+@pytest.mark.parametrize("CGALayout", [[[0, 0]],  # 1x1 cluster (single-cta)
+                                       [[0, 1]],  # 1x2 cluster
+                                       [[1, 0], [2, 0]],  # 4x1 cluster
+                                       [[0, 1], [0, 2]],  # 1x4 cluster
+                                       [[1, 0], [0, 1]],  # 2x2 cluster
+                                       ])
+def test_compile_tdm_gather_multi_cta(CGALayout):
+    """Test that TDM gather compiles for multi-CTA layouts."""
+    BLOCK_M = 16
+    BLOCK_N = 64
+    NUM_WARPS = 1
+    SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0], CGALayout)
+    BLOCK_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [NUM_WARPS, 1], [1, 0], CGALayout)
+    IDX_CGA_LAYOUT: ttgl.constexpr = [[basis[0], 0] for basis in CGALayout]
+    IDX_PARENT_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([BLOCK_M, 1], [1, 32], [1, NUM_WARPS], [1, 0],
+                                                           IDX_CGA_LAYOUT)
+    IDX_LAYOUT: ttgl.constexpr = ttgl.SliceLayout(1, IDX_PARENT_LAYOUT)
+    num_ctas = 2**len(CGALayout)
+
+    signature = {
+        "inp_ptr": "*fp16",
+        "out_ptr": "*fp16",
+        "src_row_indices_ptr": "*i32",
+        "M_inp": "i32",
+        "N_inp": "i32",
+        "stride_m": "i32",
+        "BLOCK_M": "constexpr",
+        "BLOCK_N": "constexpr",
+        "SRC_COL_OFFSET": "constexpr",
+        "SHARED_LAYOUT": "constexpr",
+        "BLOCK_LAYOUT": "constexpr",
+        "IDX_LAYOUT": "constexpr",
+    }
+    constexprs = {
+        "BLOCK_M": BLOCK_M,
+        "BLOCK_N": BLOCK_N,
+        "SRC_COL_OFFSET": 0,
+        "SHARED_LAYOUT": SHARED_LAYOUT,
+        "BLOCK_LAYOUT": BLOCK_LAYOUT,
+        "IDX_LAYOUT": IDX_LAYOUT,
+    }
+
+    k = triton.compile(gluon._runtime.GluonASTSource(tdm_gather_multi_cta_kernel, signature, constexprs),
+                       target=GPUTarget("hip", 'gfx1250', 32), options={"num_warps": NUM_WARPS, "num_ctas": num_ctas})
+    assert re.search("tensor_load_to_lds", k.asm["amdgcn"])
 
 
 @pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
@@ -4036,6 +4218,51 @@ def test_runtime_tdm_gather(NUM_INDICES, BLOCK_M, BLOCK_N, src_col_offset, dtype
     inp_bytes = inp.view(torch.uint8).reshape(M_inp, -1)
     ref_bytes = inp_bytes[src_row_indices.long(), src_col_offset * elem_size:(src_col_offset + BLOCK_N) * elem_size]
     torch.testing.assert_close(gathered_out.view(torch.uint8), ref_bytes)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
+@pytest.mark.parametrize("CGALayout", [[[0, 0]],  # 1x1 cluster (single-cta)
+                                       [[0, 1]],  # 1x2 cluster
+                                       [[1, 0], [2, 0]],  # 4x1 cluster
+                                       [[0, 1], [0, 2]],  # 1x4 cluster
+                                       [[1, 0], [0, 1]],  # 2x2 cluster
+                                       ])
+@pytest.mark.parametrize("src_col_offset,physical_tail_cols", [(0, 0), (16, 16)])
+def test_runtime_tdm_gather_multi_cta(CGALayout, src_col_offset, physical_tail_cols):
+    """Test TDM gather correctness with multi-CTA and multicast layouts."""
+    torch.manual_seed(42)
+
+    BLOCK_M = 16
+    BLOCK_N = 64
+    NUM_WARPS = 1
+    num_ctas = 2**len(CGALayout)
+    SHARED_LAYOUT: ttgl.constexpr = ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0], CGALayout)
+    BLOCK_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([1, 8], [4, 8], [NUM_WARPS, 1], [1, 0], CGALayout)
+    IDX_CGA_LAYOUT: ttgl.constexpr = [[basis[0], 0] for basis in CGALayout]
+    IDX_PARENT_LAYOUT: ttgl.constexpr = ttgl.BlockedLayout([BLOCK_M, 1], [1, 32], [1, NUM_WARPS], [1, 0],
+                                                           IDX_CGA_LAYOUT)
+    IDX_LAYOUT: ttgl.constexpr = ttgl.SliceLayout(1, IDX_PARENT_LAYOUT)
+
+    M_inp = 128
+    N_inp = BLOCK_N
+    physical_N_inp = N_inp + physical_tail_cols
+    inp = _create_scatter_test_data((M_inp, physical_N_inp), torch.float16)
+    out = torch.zeros((BLOCK_M, BLOCK_N), dtype=torch.float16)
+    src_row_indices = torch.randperm(M_inp, dtype=torch.int32)[:BLOCK_M]
+
+    inp_d = inp.cuda()
+    out_d = out.cuda()
+    indices_d = src_row_indices.cuda()
+
+    tdm_gather_multi_cta_kernel[(1, )](inp_d, out_d, indices_d, M_inp=M_inp, N_inp=N_inp, stride_m=inp_d.stride(0),
+                                       BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, SHARED_LAYOUT=SHARED_LAYOUT,
+                                       SRC_COL_OFFSET=src_col_offset, BLOCK_LAYOUT=BLOCK_LAYOUT, IDX_LAYOUT=IDX_LAYOUT,
+                                       num_warps=NUM_WARPS, num_ctas=num_ctas)
+
+    valid_cols = N_inp - src_col_offset
+    ref = torch.zeros_like(out)
+    ref[:, :valid_cols] = inp[src_row_indices.long(), src_col_offset:N_inp]
+    torch.testing.assert_close(out_d.cpu().view(torch.uint8), ref.view(torch.uint8))
 
 
 @pytest.mark.parametrize("BLOCK_M", [16, 32, 64, 128, 256])
@@ -4171,7 +4398,8 @@ def tdm_gather_multi_col_kernel(inp_ptr, out_ptr, src_row_indices_ptr, M, N, str
     src_row_indices = ttgl.load(src_row_indices_ptr + pid_m * BLOCK_M + idx_offs, mask=idx_mask, other=M)
 
     col_offset = pid_n * BLOCK_N
-    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, col_offset, smem)
+    inp_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(inp_desc, add_offsets=[0, col_offset], clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
     out_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=out_ptr, shape=(M, N), strides=(stride_m, 1),
@@ -4200,7 +4428,9 @@ def _tdm_gather_layout_kernel(inp_ptr, out_ptr, src_row_indices_ptr, M_inp, N_in
     idx_offs = ttgl.arange(0, NUM_INDICES, layout=IDX_LAYOUT)
     src_row_indices = ttgl.load(src_row_indices_ptr + idx_offs)
 
-    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, SRC_COL_OFFSET, smem)
+    inp_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(inp_desc, add_offsets=[0, SRC_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_gather(inp_desc, src_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
     out_desc = ttgl.amd.gfx1250.tdm.make_tensor_descriptor(base=out_ptr, shape=(BLOCK_M, BLOCK_N), strides=(BLOCK_N, 1),
@@ -4322,7 +4552,9 @@ def _tdm_scatter_layout_kernel(inp_ptr, out_ptr, dst_row_indices_ptr, M_out, N_o
     idx_offs = ttgl.arange(0, NUM_INDICES, layout=IDX_LAYOUT)
     dst_row_indices = ttgl.load(dst_row_indices_ptr + idx_offs)
 
-    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, DST_COL_OFFSET, smem)
+    out_desc = ttgl.amd.gfx1250.tdm.update_tensor_descriptor(out_desc, add_offsets=[0, DST_COL_OFFSET],
+                                                             clamp_bounds=True)
+    ttgl.amd.gfx1250.tdm.async_scatter(out_desc, dst_row_indices, smem)
     ttgl.amd.gfx1250.tdm.async_wait(0)
 
 
@@ -4489,3 +4721,73 @@ def test_cache_modifier(loadCM, storeCM, test_kernel):
 
     assert load_found
     assert store_found
+
+
+# Multi-CTA batched matmul: each CTA in the cluster computes one batch of A @ B.
+@gluon.jit
+def gemm_3d_cga_split_kernel(a_ptr, b_ptr, c_ptr, M, N, K,  #
+                             BLOCK_M: ttgl.constexpr, BLOCK_N: ttgl.constexpr, BLOCK_K: ttgl.constexpr,
+                             NUM_CTAS: ttgl.constexpr, K_WIDTH: ttgl.constexpr, load_layout: ttgl.constexpr,
+                             wmma_layout: ttgl.constexpr):
+    load_dim0_layout: ttgl.constexpr = ttgl.SliceLayout(1, ttgl.SliceLayout(2, load_layout))
+    load_dim1_layout: ttgl.constexpr = ttgl.SliceLayout(0, ttgl.SliceLayout(2, load_layout))
+    load_dim2_layout: ttgl.constexpr = ttgl.SliceLayout(0, ttgl.SliceLayout(1, load_layout))
+    wmma_dim0_layout: ttgl.constexpr = ttgl.SliceLayout(1, ttgl.SliceLayout(2, wmma_layout))
+    wmma_dim1_layout: ttgl.constexpr = ttgl.SliceLayout(0, ttgl.SliceLayout(2, wmma_layout))
+    wmma_dim2_layout: ttgl.constexpr = ttgl.SliceLayout(0, ttgl.SliceLayout(1, wmma_layout))
+
+    ob = ttgl.arange(0, NUM_CTAS, layout=load_dim0_layout)
+    om = ttgl.arange(0, BLOCK_M, layout=load_dim1_layout)
+    ok = ttgl.arange(0, BLOCK_K, layout=load_dim2_layout)
+    okb = ttgl.arange(0, BLOCK_K, layout=load_dim1_layout)
+    on = ttgl.arange(0, BLOCK_N, layout=load_dim2_layout)
+
+    offs_a = ob[:, None, None] * (M * K) + om[None, :, None] * K + ok[None, None, :]
+    a = ttgl.load(a_ptr + offs_a)
+    offs_b = ob[:, None, None] * (K * N) + okb[None, :, None] * N + on[None, None, :]
+    b = ttgl.load(b_ptr + offs_b)
+
+    a = ttgl.convert_layout(a, ttgl.DotOperandLayout(0, wmma_layout, K_WIDTH))
+    b = ttgl.convert_layout(b, ttgl.DotOperandLayout(1, wmma_layout, K_WIDTH))
+    acc = ttgl.zeros((NUM_CTAS, BLOCK_M, BLOCK_N), dtype=ttgl.float32, layout=wmma_layout)
+    acc = ttgl.amd.gfx1250.wmma(a, b, acc)
+
+    sb = ttgl.arange(0, NUM_CTAS, layout=wmma_dim0_layout)
+    sm = ttgl.arange(0, BLOCK_M, layout=wmma_dim1_layout)
+    sn = ttgl.arange(0, BLOCK_N, layout=wmma_dim2_layout)
+    offs_c = sb[:, None, None] * (BLOCK_M * BLOCK_N) + sm[None, :, None] * BLOCK_N + sn[None, None, :]
+    ttgl.store(c_ptr + offs_c, acc)
+
+
+@pytest.mark.skipif(not is_hip_gfx1250(), reason="Requires GFX1250")
+@pytest.mark.parametrize("num_ctas", [2, 4])
+def test_runtime_gemm_3d_multi_cta(num_ctas):
+    BLOCK_M = BLOCK_N = 32
+    BLOCK_K = 64
+    num_warps = 4
+    M, N, K = BLOCK_M, BLOCK_N, BLOCK_K
+
+    cga = make_cga_layout([num_ctas, 1, 1], [num_ctas, 1, 1], [2, 1, 0])
+    n_warps = 2
+    m_warps = num_warps // n_warps
+    sM = BLOCK_M // (m_warps * 8)
+    sN = BLOCK_N // (n_warps * 4)
+    load_layout = ttgl.BlockedLayout([1, sM, sN], [1, 8, 4], [1, m_warps, n_warps], [2, 1, 0], cga)
+    warp_bases = [[0, 0, 1]]
+    for i in range(int(math.log2(num_warps // 2))):
+        warp_bases.append([0, 1 << i, 0])
+    wmma_layout = ttgl.amd.AMDWMMALayout(version=3, transposed=True, warp_bases=warp_bases, reg_bases=[],
+                                         instr_shape=[16, 16, 32], cga_layout=cga, rank=3)
+
+    torch.manual_seed(0)
+    a = torch.randn((num_ctas, M, K), dtype=torch.float16)
+    b = torch.randn((num_ctas, K, N), dtype=torch.float16)
+    c = torch.zeros((num_ctas, M, N), dtype=torch.float32)
+    a_device, b_device, c_device = a.cuda(), b.cuda(), c.cuda()
+
+    # Launching with num_ctas > 1 runs the multi-CTA CGA-layout verifier on the rank-3 dot.
+    gemm_3d_cga_split_kernel[(1, )](a_device, b_device, c_device, M, N, K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+                                    BLOCK_K=BLOCK_K, NUM_CTAS=num_ctas, K_WIDTH=8, load_layout=load_layout,
+                                    wmma_layout=wmma_layout, num_warps=num_warps, num_ctas=num_ctas)
+
+    torch.testing.assert_close(c_device.cpu(), torch.bmm(a.float(), b.float()), rtol=2e-2, atol=2e-2)

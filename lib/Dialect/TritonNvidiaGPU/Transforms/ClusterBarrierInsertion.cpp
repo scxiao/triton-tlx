@@ -30,8 +30,8 @@ static bool isDistributedMultiCTAOp(Operation *op, bool isRead) {
     auto srcTy = cvt.getSrc().getType();
     auto dstTy = cvt.getType();
     auto kBlock = StringAttr::get(op->getContext(), "block");
-    auto conversion = minimalCvtLayout(srcTy, dstTy);
-    return conversion.hasInDim(kBlock);
+    return !isCvtDimSync(ttg::toLinearLayout(srcTy), ttg::toLinearLayout(dstTy),
+                         kBlock);
   }
   if (auto reduce = dyn_cast<triton::ReduceOp>(op)) {
     if (!isRead)
@@ -48,6 +48,8 @@ static bool isDistributedMultiCTAOp(Operation *op, bool isRead) {
            "Scaled MMA with 2CTAs not supported");
     return false;
   } else if (auto tma = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
+    return tma.getMulticast();
+  } else if (auto tma = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
     return tma.getMulticast();
   }
   return false;
@@ -99,6 +101,12 @@ usesTrackedBarrierInCrossCTAConsumerOp(Operation *op,
   if (auto tma = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op)) {
     return tma.getMulticast() && !tma.getMulticastTargets() &&
            aliasesTracked(tma.getBarrier());
+  }
+  if (auto tma = dyn_cast<ttng::AsyncTMAGatherOp>(op)) {
+    return tma.getMulticast() && aliasesTracked(tma.getBarrier());
+  }
+  if (auto clc = dyn_cast<ttng::CLCTryCancelOp>(op)) {
+    return aliasesTracked(clc.getMbarrier());
   }
   return false;
 }

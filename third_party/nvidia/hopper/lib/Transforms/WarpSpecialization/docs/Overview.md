@@ -18,12 +18,16 @@ doTaskPartition          (Hopper only; skipped on Blackwell)
   → doDynamicTileBroadcast  (run-once tile-id: atomic counter + CLC fetch)
   → doDataPartition      (via nvgpu-ws-data-partition when requested)
   → doPingPongPrep       (optional, if pingpongAutoWS is set)
+  → doConvertDescriptorLoadsToNVWS
   → doBufferAllocation
   → doMemoryPlanner
   → doCodePartition
   → doPingPongSync       (optional)
   → doTokenLowering
   → doLoopSchedulePreprocessing + scheduleLoops  (external, not in this directory)
+  → SoftwarePipeliner::lowerLoops
+  → peelPartitionLoops   (first masked tile vs. unmasked remainder)
+  → SoftwarePipeliner::expandLoops
 ```
 
 On Blackwell, task assignments are expected to come from an earlier partition
@@ -44,6 +48,15 @@ Before `PartitionSchedulingMeta`, the Meta WS backend runs
 elementwise users. This keeps broadcasts and their value materialization, such
 as a descriptor load followed by an extend, associated with their use after
 other operands, such as TMEM loads, have been prepared.
+
+For explicitly enabled dependent 2-CTA matmul graphs, the backend runs
+`nvgpu-analyze-2cta-dependencies` after matmul acceleration and before 2-CTA
+descriptor-load rewriting. It follows the SSA chain into each collaborative
+MMA and marks collective contractions separately from operands that require a
+peer gather. `nvgpu-plan-2cta-exchange` then inserts an abstract gather before
+buffer allocation. After AutoWS and software pipelining,
+`nvgpu-materialize-2cta-exchange` reuses the planned dQ shared buffer for the
+local and remote halves and lowers the gather to DSMEM stores and barriers.
 
 The TMA store wait pipeline is enabled by default and can be disabled with the
 `nvgpu-warp-specialization` pass option `tma-store-pipelining=false`. Disabling
@@ -78,6 +91,9 @@ recognizes the `scf.while` outer loop (same doc).
 | `WarpSpecialization.cpp` | `NVGPUWarpSpecialization` | Top-level pipeline orchestration |
 | `SinkBroadcast.cpp` | `nvgpu-sink-broadcast` | Pre-partition peephole that sinks `tt.broadcast` producer chains to elementwise users |
 | `PartitionSchedulingMeta.cpp` | `nvgpu-partition-scheduling-meta` | Partition scheduling for Blackwell (assigns `ttg.partition` attributes), including ordered-subset-carry `scf.while`. See [PartitionSchedulingMeta.md](PartitionSchedulingMeta.md); downstream dynamic/CLC validation is tracked in [WarpSpecializeWhileLoops.md](WarpSpecializeWhileLoops.md) |
+| `../../Analyze2CTADependencies.cpp` | `nvgpu-analyze-2cta-dependencies` | Classifies dependent 2-CTA MMA operand chains as collective contractions or peer gathers before AutoWS; see [AutoWS2CTABackwardPlan.md](AutoWS2CTABackwardPlan.md) |
+| `../../Plan2CTAExchange.cpp` | `nvgpu-plan-2cta-exchange` | Inserts an abstract peer-gather SSA dependency before AutoWS scheduling and memory planning |
+| `../../Materialize2CTAExchange.cpp` | `nvgpu-materialize-2cta-exchange` | Lowers planned peer gathers after pipelining to local stores and async peer stores completed on the existing AutoWS full barrier |
 | (frontend) | `tl.range` / `tl.condition` → `tt.*` loop attrs | The user-facing AutoWS/pipelining annotations, their IR attributes and consumers, and what works on `scf.while` today: [AutoWSAnnotations.md](AutoWSAnnotations.md) |
 | `WSTaskPartition.cpp` | `doTaskPartition` | Assigns `async_task_id` to anchor ops (loads, dots, stores) — Hopper only |
 | `TaskIdPropagation.cpp` | — | `TaskIdBackwardPropagation` sparse dataflow analysis |
@@ -89,7 +105,8 @@ recognizes the `scf.while` outer loop (same doc).
 | `WSBuffer.cpp` | `appendAccumCntsForOps` | Accumulation counter infrastructure for multi-buffer indexing |
 | `WSMemoryPlanner.cpp` | `doMemoryPlanner` | Plans SMEM and TMEM allocation (multi-buffering, liveness) |
 | `WSCodePartition.cpp` | `doCodePartition` | Creates channels, inserts async copies and barriers |
-| `WSLowerMem.cpp` | — | Memory lowering: async copies between global/shared/tensor memory |
+| `Pipeliner/PartitionLoopPeeling.cpp` | `peelPartitionLoops` | After scheduled-load lowering, peels a partition-local first iteration when `iv < lb + step`, folding the masked prologue and unmasked remainder predicates |
+| `WSLowerMem.cpp` | `doConvertDescriptorLoadsToNVWS` / `optimizeTMALoads` | Converts `tt.descriptor_load` to buffered `nvws.descriptor_load` before buffer hoisting, then lowers it to async TMA copies after planning |
 | `WSSpecialize.cpp` | `specializeRegion` | Clones ops into `ttg.WarpSpecializeOp` regions |
 | `WSLowerToken.cpp` | `doTokenLowering` | Lowers `ProducerAcquireOp`/`ConsumerWaitOp` to hardware barriers |
 | `WSTMAStoreLowering.cpp` | `doTMAStoreLowering` | Pre-pass lowering of `tt.descriptor_store` for WS visibility |
@@ -134,6 +151,7 @@ recognizes the `scf.while` outer loop (same doc).
 - [Data Partitioning](DataPartition.md) — splitting tensor dimensions across consumer warp groups
 - [Code Partitioning](CodePartition.md) — channel discovery, buffer creation, sync insertion
 - [Code Specialization](CodeSpecialization.md) — how ops are cloned into WarpSpecializeOp regions
+- [Partition Loop Peeling](PartitionLoopPeeling.md) — first-tile control-flow peeling after physical specialization
 - [Memory Lowering](MemoryLowering.md) — async copy creation and TMA store lowering
 - [Token & Barrier Lowering](TokenBarrierLowering.md) — lowering abstract tokens to hardware mbarriers
 - [Buffer Allocation](BufferAllocation.md) — channel discovery and SMEM/TMEM allocation hoisting

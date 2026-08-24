@@ -6,6 +6,7 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
+#include "triton/Dialect/TritonInstrument/IR/ConSanConstants.h"
 
 #include "third_party/amd/include/Dialect/TritonAMDGPU/Utility/CommonUtils.h"
 
@@ -82,6 +83,11 @@ unsigned AMDAllocationAnalysisScratchSizeFn(Operation *op,
       else
         captureSize += mlir::triton::gpu::getSharedMemorySize(type);
     }
+    // ConSan adds captures after allocation; reserve space pre-computed by the
+    // common TritonInstrumentPrepareConSanCaptures pass.
+    if (auto extra = ws->getAttrOfType<IntegerAttr>(
+            mlir::triton::instrument::kConSanExtraCaptureBytesAttr))
+      captureSize += extra.getInt();
     return captureSize;
   }
 

@@ -11,14 +11,20 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
+#include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Gluon/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonInstrument/Transforms/ConSanTargetHooks.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierInsertion.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h"
 
 #include "Allocation.h"
 #include "PatternTritonGPUOpToLLVM.h"
@@ -90,6 +96,16 @@ struct ConvertTritonGPUToLLVM
       : ConvertTritonGPUToLLVMBase({computeCapability}) {}
   ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion)
       : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion}) {}
+  ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
+                         bool enableConcurrencySanitizer)
+      : ConvertTritonGPUToLLVMBase(
+            {computeCapability, ptxVersion, enableConcurrencySanitizer}) {}
+  ConvertTritonGPUToLLVM(int32_t computeCapability, int32_t ptxVersion,
+                         bool enableConcurrencySanitizer,
+                         bool enableTreeReduction)
+      : ConvertTritonGPUToLLVMBase({computeCapability, ptxVersion,
+                                    enableConcurrencySanitizer,
+                                    enableTreeReduction}) {}
 
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -110,6 +126,25 @@ struct ConvertTritonGPUToLLVM
     if (failed(maybeInsertClusterSync(mod))) {
       return signalPassFailure();
     }
+    if (enableConcurrencySanitizer) {
+      auto hooks = mlir::triton::instrument::createConSanHooks("nvidia");
+      assert(hooks && "no ConSan hooks registered for nvidia");
+      if (failed(
+              mlir::triton::instrument::runConcurrencySanitizer(mod, *hooks)))
+        return signalPassFailure();
+      mlir::PassManager cleanupPm(context);
+      cleanupPm.addPass(mlir::triton::gluon::createGluonCanonicalize());
+      cleanupPm.addPass(mlir::createCSEPass());
+      if (failed(cleanupPm.run(mod)))
+        return signalPassFailure();
+    }
+    mlir::triton::nvidia_gpu::runClusterBarrierMbarAllocator(mod);
+    bool hasGlobalScratchAlloc = false;
+    mod.walk([&](triton::gpu::GlobalScratchAllocOp) {
+      hasGlobalScratchAlloc = true;
+    });
+    if (hasGlobalScratchAlloc)
+      mlir::triton::gpu::runGlobalScratchMemoryAllocation(mod);
 
     mlir::LowerToLLVMOptions option(context);
     option.overrideIndexBitwidth(32);
@@ -149,15 +184,16 @@ struct ConvertTritonGPUToLLVM
     populateLoadStoreOpToLLVMPatterns(typeConverter, targetInfo,
                                       computeCapability, patterns,
                                       axisInfoAnalysis, benefit);
-    mlir::triton::populateReduceOpToLLVMPatterns(typeConverter, patterns,
-                                                 targetInfo, benefit);
+    mlir::triton::populateReduceOpToLLVMPatternsWithOptions(
+        typeConverter, patterns, targetInfo, benefit, enableTreeReduction);
     mlir::triton::populateScanOpToLLVMPatterns(typeConverter, patterns,
                                                targetInfo, benefit);
     mlir::triton::populateGatherOpToLLVMPatterns(typeConverter, patterns,
                                                  targetInfo, benefit);
     populateBarrierOpToLLVMPatterns(typeConverter, patterns, benefit,
                                     targetInfo);
-    populateClusterOpsToLLVMPatterns(typeConverter, patterns, benefit);
+    populateClusterOpsToLLVMPatterns(typeConverter, patterns, benefit,
+                                     targetInfo);
     mlir::triton::populateHistogramOpToLLVMPatterns(typeConverter, patterns,
                                                     targetInfo, benefit);
     mlir::triton::populatePrintOpToLLVMPattern(typeConverter, patterns,
@@ -516,6 +552,22 @@ createConvertTritonGPUToLLVMPass(int32_t computeCapability,
                                  int32_t ptxVersion) {
   return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability,
                                                   ptxVersion);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
+                                 bool enableConcurrencySanitizer) {
+  return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
+                                                  enableConcurrencySanitizer);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonGPUToLLVMPass(int32_t computeCapability, int32_t ptxVersion,
+                                 bool enableConcurrencySanitizer,
+                                 bool enableTreeReduction) {
+  return std::make_unique<ConvertTritonGPUToLLVM>(computeCapability, ptxVersion,
+                                                  enableConcurrencySanitizer,
+                                                  enableTreeReduction);
 }
 
 bool NVIDIA::canSkipBarSync(Operation *before, Operation *after,

@@ -22,17 +22,20 @@ public:
 
   void barrier(Location loc, RewriterBase &rewriter,
                triton::gpu::AddrSpace targets) const override;
-  void clusterBarrier(Location loc, RewriterBase &rewriter) const override;
+  void clusterBarrier(Location loc, RewriterBase &rewriter,
+                      Operation *sourceOp) const override;
 
   void warpSync(Location loc, RewriterBase &rewriter) const override;
 
   void
-  storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
-               std::optional<Value> ctaId, Value val, Value pred,
+  storeDShared(RewriterBase &rewriter, Location loc, Value ptr, Value ctaId,
+               Value val, Value pred,
                std::optional<Value> barrierPtr = std::nullopt) const override;
   Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                    std::optional<Value> ctaId, Type elemTy, Value pred,
+                    Value ctaId, Type elemTy, Value pred,
                     Operation *localLoadOp = nullptr) const override;
+  Value mapDShared(RewriterBase &rewriter, Location loc, Value ptr, Value ctaId,
+                   Value pred) const;
 
   void copyBulkSharedToRemoteShared(RewriterBase &rewriter, Location loc,
                                     Value srcPtr, Value dstPtr,
@@ -97,6 +100,10 @@ public:
   int getComputeCapability() const {
     return targetFeatures.getComputeCapability();
   }
+  bool supportsMbarrierMulticast() const {
+    // mbarrier.arrive.multicast was introduced in PTX 9.4 for Rubin.
+    return targetFeatures.supportsMbarMulticast() && ptxVersion >= 94;
+  }
   const triton::nvidia_gpu::TargetFeatures &getTargetFeatures() const {
     return targetFeatures;
   }
@@ -104,6 +111,8 @@ public:
   bool isCuda() const override { return true; }
 
 private:
+  bool useExplicitSharedStore() const;
+
   triton::nvidia_gpu::TargetFeatures targetFeatures;
   int ptxVersion;
 };

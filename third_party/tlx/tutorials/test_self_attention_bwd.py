@@ -2,7 +2,7 @@
 hand-written TLX bwd, and both vs a torch-autograd float causal-SiLU reference.
 
 Runs WITHOUT meta-WS (TRITON_USE_META_WS unset): the TLX self-attn fwd uses
-num_stages=0 and asserts under meta-WS, so this is the process where plain-Triton
+num_stages=1 and asserts under meta-WS, so this is the process where plain-Triton
 and TLX can coexist. (The autoWS variant is a separate process /
 test_self_attention_autows.py.) HSTU_SELF_PIN=1 pins the bwd autotune to one
 config so it compiles fast instead of building the ~29-config bwd space.
@@ -26,11 +26,13 @@ _C.set_config(autows=False, pin=True)
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
+from triton._internal_testing import is_blackwell  # noqa: E402
 
 import bench_self as bs  # noqa: E402
 
 
 @pytest.mark.parametrize("L,Z", [(256, 4), (512, 2)])
+@pytest.mark.skipif(not is_blackwell(), reason="TLX self-attention backward requires Blackwell GPU")
 def test_self_attention_bwd_triton_vs_tlx(L, Z):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")

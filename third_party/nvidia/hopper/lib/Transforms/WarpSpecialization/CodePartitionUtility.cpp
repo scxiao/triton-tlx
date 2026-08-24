@@ -13,6 +13,7 @@
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
 namespace ttng = ::mlir::triton::nvidia_gpu;
+namespace ttnvws = ::mlir::triton::nvws;
 namespace mlir {
 
 #define DEBUG_TYPE "nvgpu-ws-utility"
@@ -139,7 +140,7 @@ Operation *AllocChannel::getSrcOp() {
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (isa<ttg::LocalStoreOp>(user))
+    if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user))
       return user;
     if (isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       return user;
@@ -163,7 +164,7 @@ static void getAllConsumers(AllocChannel *ch,
     Operation *user = skipIdxOp(usr);
     if (!user)
       continue;
-    if (!isa<ttg::LocalStoreOp>(user) &&
+    if (!isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user) &&
         !isa<ttng::AsyncTMACopyGlobalToLocalOp>(user))
       consumers.push_back(user);
   }
@@ -388,23 +389,10 @@ unsigned ttng::TmemAllocChannel::getNumBuffers() {
   return 1;
 }
 
-// Check to see if there is no outer loop that is enclosed under ifOp.
-bool immediateEnclosing(scf::IfOp ifOp, Operation *subOp) {
-  auto pOp = subOp->getParentOfType<scf::ForOp>();
-  if (!pOp)
-    return true;
-  return !enclosing(ifOp, pOp.getOperation());
-}
-
 // Control Ops can be replaced during the pass, but channel srcOp/dstOp should
 // be valid.
 static bool needAccumCntForReuse(Operation *ctrlOp, ReuseGroup *group) {
-  // A collapsed both-endpoints-subtiled channel is the sole member of its group
-  // and still needs a shared accumCnt (the numTiles counter stride feeds the
-  // in-body per-tile slot/phase rotation) even at buffer.copy == 1. Only plain
-  // single-buffered groups carry no accumCnt.
-  if (group->channels[0]->getNumBuffers() <= 1 &&
-      !channelIsCollapsedBothSubtiled(group->channels[0]))
+  if (!reuseGroupNeedsAccumCnt(group))
     return false;
   // Goes through each channel in the ResuseGroup, check srcOp and dstOp to
   // see if it is inside ctrlOp.
@@ -560,21 +548,26 @@ bool channelIsCollapsedBothSubtiled(Channel *ch) {
   return static_cast<AllocChannel *>(ch)->isCollapsedBothSubtiled;
 }
 
+bool reuseGroupNeedsAccumCnt(ReuseGroup *group) {
+  if (!group || group->channels.empty())
+    return false;
+  Channel *representative = group->channels.front();
+  // A collapsed both-endpoints-subtiled channel still needs its numTiles
+  // counter stride when it is the sole group member and buffer.copy == 1.
+  if (representative->getNumBuffers() <= 1 &&
+      !channelIsCollapsedBothSubtiled(representative))
+    return false;
+  if (group->channels.size() <= 1 && !channelIsSubtiled(representative))
+    return false;
+  return true;
+}
+
 void getReuseChannels(ReuseGroup *group, Operation *regionOp,
                       SmallVector<Operation *> &chList) {
   if (!isa<scf::ForOp>(regionOp) && !isa<scf::IfOp>(regionOp) &&
       !isa<scf::WhileOp>(regionOp))
     return;
-  // A collapsed subtiled channel needs its dst region threaded into chList for
-  // the numTiles counter stride even at buffer.copy == 1 (single physical slot,
-  // alternating barrier phase); only plain single-buffered groups bail here.
-  if (group->channels[0]->getNumBuffers() <= 1 &&
-      !channelIsCollapsedBothSubtiled(group->channels[0]))
-    return;
-  // Size-1 reuse groups normally carry no shared circular buffer, but a
-  // collapsed subtiled channel is intentionally alone in its group and still
-  // needs its dst region threaded into chList for the numTiles counter stride.
-  if (group->channels.size() <= 1 && !channelIsSubtiled(group->channels[0]))
+  if (!reuseGroupNeedsAccumCnt(group))
     return;
   // Goes through body of regionOp, if the body op is a regionOp, check
   // to see if it contains a channel in the reuse group.
@@ -748,6 +741,17 @@ std::pair<Value, Value> getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder,
 //     ThenYield ForC.arg[accumIfB] + 1
 //     ElseYield ForC.arg[accumIfB]
 //   Channel D --> uses ForA.arg[accumForA]
+static Operation *
+getAccumCntRegion(Operation *op, Operation *parentLoop,
+                  const DenseSet<Operation *> &regionsWithChannels) {
+  Operation *region = op->getParentOp();
+  while (region && region != parentLoop &&
+         !regionsWithChannels.contains(region))
+    region = region->getParentOp();
+  assert(region && "operation must be nested under its accumulation loop");
+  return region;
+}
+
 Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
                     const DenseSet<Operation *> &regionsWithChannels,
                     ReuseConfig *config, int reuseGroupIdx) {
@@ -759,7 +763,8 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     // carried across persistent iterations.
     if (auto parentWhileOp = op->getParentOfType<scf::WhileOp>()) {
       Block *afterBlk = parentWhileOp.getAfterBody();
-      auto *pOp = op->getParentOp();
+      Operation *pOp = getAccumCntRegion(op, parentWhileOp.getOperation(),
+                                         regionsWithChannels);
       unsigned tSize = afterBlk->getNumArguments();
       unsigned parentTCnts =
           getAccumCnts(parentWhileOp, regionsWithChannels, config);
@@ -776,7 +781,8 @@ Value getAccumCount(OpBuilderWithAsyncTaskIds &builder, Operation *op,
     return arith::ConstantIndexOp::create(builder, op->getLoc(), 0);
   }
 
-  auto *pOp = op->getParentOp();
+  Operation *pOp =
+      getAccumCntRegion(op, parentForOp.getOperation(), regionsWithChannels);
   // Get parentForOp.arg[pOp]
   unsigned tSize = parentForOp.getBody()->getArguments().size();
   unsigned parentTCnts = getAccumCnts(parentForOp, regionsWithChannels, config);
@@ -1759,8 +1765,8 @@ static bool isKeyOp(Operation *op) {
     return true;
 
   // Load operations
-  if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp, ttg::LocalLoadOp>(
-          op))
+  if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+          ttg::LocalLoadOp>(op))
     return true;
 
   // Store operations
@@ -1865,9 +1871,10 @@ static std::string getKeyOpDescription(Operation *op) {
   }
 
   // For loads, show source and result
-  if (auto loadOp = dyn_cast<tt::DescriptorLoadOp>(op)) {
+  if (auto loadOp = dyn_cast<ttnvws::DescriptorLoadOp>(op)) {
+    // NVWS "result" is the destination memdesc operand, not an SSA result.
     ss << opName << " " << formatInput(loadOp.getDesc()) << " -> "
-       << formatOutput(loadOp.getResult());
+       << formatInput(loadOp.getResult());
     return result;
   }
   if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
@@ -2088,7 +2095,7 @@ static std::string getKeyOpLabel(Operation *op) {
     std::string aName = getValueDisplayName(mmaOp.getA());
     std::string bName = getValueDisplayName(mmaOp.getB());
     label += outputName + " = " + opName + "(" + aName + ", " + bName + ")";
-  } else if (isa<tt::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
+  } else if (isa<ttnvws::DescriptorLoadOp, tt::LoadOp, ttng::TMEMLoadOp,
                  ttg::LocalLoadOp>(op)) {
     // Load: out = load(src)
     std::string inputs = getTensorInputs(op);
@@ -3483,7 +3490,7 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
         // Alloc associated with operand D can have multiple producers.
         assert(mmaOp.getAccumulator() != allocOp->getResult(0));
         consumers.push_back(user);
-      } else if (isa<ttg::LocalStoreOp>(user)) {
+      } else if (isa<ttg::LocalStoreOp, ttnvws::DescriptorLoadOp>(user)) {
         assert(producerOp == nullptr);
         producerOp = user;
       } else if (auto subtiled = dyn_cast<ttng::SubtiledRegionOp>(user)) {
@@ -3546,9 +3553,16 @@ static void createAllocChannel(Operation *allocOp, mlir::DominanceInfo &dom,
   SmallVector<int> consumerTaskIds;
   DenseSet<int> seenTaskIds;
   for (auto *consumer : consumers) {
-    for (int id : getAsyncTaskIds(consumer)) {
-      if (seenTaskIds.insert(id).second)
-        consumerTaskIds.push_back(id);
+    SmallVector<Operation *> taskOwners = {consumer};
+    // A memdesc view can carry boundary task IDs that do not all consume the
+    // buffer. Descriptor channels synchronize with the terminal consumers.
+    if (isa<ttnvws::DescriptorLoadOp>(producerOp))
+      taskOwners = getActualConsumers(consumer);
+    for (Operation *taskOwner : taskOwners) {
+      for (int id : getAsyncTaskIds(taskOwner)) {
+        if (seenTaskIds.insert(id).second)
+          consumerTaskIds.push_back(id);
+      }
     }
   }
 

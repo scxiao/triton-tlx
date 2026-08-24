@@ -760,8 +760,9 @@ loadDotOperandEnc(triton::LoadOp ld) {
   return nullptr;
 }
 
-static void lowerLoadToStagedCopy(scf::ForOp forOp, triton::LoadOp ld,
-                                  const triton::AMD::TargetInfo &targetInfo) {
+static void
+lowerLoadToStagedCopy(scf::ForOp forOp, triton::LoadOp ld,
+                      const triton::amdgpu::TargetFeatures &targetFeatures) {
   auto ty = dyn_cast<RankedTensorType>(ld.getType());
   if (!ty || ty.getRank() != 2)
     return;
@@ -775,7 +776,7 @@ static void lowerLoadToStagedCopy(scf::ForOp forOp, triton::LoadOp ld,
   triton::gpu::SharedEncodingTrait sharedEnc;
   if (auto dotOpEnc = loadDotOperandEnc(ld)) {
     auto srcTOM = cast<triton::gpu::TensorOrMemDesc>(ld.getType());
-    sharedEnc = composePaddedLayout(targetInfo, dotOpEnc.getOpIdx(),
+    sharedEnc = composePaddedLayout(targetFeatures, dotOpEnc.getOpIdx(),
                                     dotOpEnc.getKWidth(), srcTOM, sharedOrder,
                                     dotOpEnc, /*useAsyncCopy=*/true);
     if (!sharedEnc)
@@ -806,8 +807,7 @@ static void lowerLoadToStagedCopy(scf::ForOp forOp, triton::LoadOp ld,
 // Opt-in (TRITON_AMD_EARLY_LOWER): early-lower every pipelineable global load
 // feeding an MFMA dot, for each inner loop.
 static void runEarlyLowerLoads(ModuleOp module) {
-  auto arch = mlir::getAMDArch(module);
-  triton::AMD::TargetInfo targetInfo(arch ? arch->str() : "");
+  auto targetFeatures = triton::amdgpu::TargetFeatures::fromModuleOp(module);
   SmallVector<scf::ForOp> loops;
   module.walk([&](scf::ForOp f) { loops.push_back(f); });
   for (scf::ForOp forOp : loops) {
@@ -817,7 +817,7 @@ static void runEarlyLowerLoads(ModuleOp module) {
         loads.push_back(ld);
     });
     for (triton::LoadOp ld : loads)
-      lowerLoadToStagedCopy(forOp, ld, targetInfo);
+      lowerLoadToStagedCopy(forOp, ld, targetFeatures);
   }
 }
 
@@ -965,6 +965,9 @@ static void runModuloExpand(ModuleOp module) {
 static void runAMDModuloScaffold(ModuleOp module,
                                  bool serializeForExpansion = false) {
   triton::gpu::AMDLatencyModel model;
+  // No forced backend on the AMD path: TRITON_USE_MODULO_SCHEDULE is the only
+  // input. Resolved once so every loop in this module uses one backend.
+  const std::string scheduleAlgo = triton::gpu::getActiveScheduleAlgo();
   // Collect loops first — E2 mutates loop bodies, so don't mutate during walk.
   SmallVector<scf::ForOp> loops;
   module.walk([&](scf::ForOp f) { loops.push_back(f); });
@@ -986,13 +989,30 @@ static void runAMDModuloScaffold(ModuleOp module,
     // E1: run the core modulo scheduler (rau/SMS, selected by
     // TRITON_USE_MODULO_SCHEDULE; default rau) and annotate each op with its
     // stage/order so a downstream expansion can consume the schedule.
-    auto schedOr = triton::gpu::runModuloScheduling(ddg);
+    auto schedOr = triton::gpu::runModuloScheduling(ddg, scheduleAlgo);
     if (!succeeded(schedOr)) {
       os << " II=FAILED";
       forOp.emitRemark() << os.str();
       continue;
     }
-    auto &sched = *schedOr;
+    auto sched = *schedOr;
+    int retryCount = 0;
+    if (serializeForExpansion) {
+      const int computedMinII = ddg.computeMinII();
+      for (; retryCount < 4 && sched.getMaxStage() > 1; ++retryCount) {
+        int maxAbsoluteCycle = 0;
+        for (auto [_, cycle] : sched.nodeToCycle)
+          maxAbsoluteCycle = std::max(maxAbsoluteCycle, cycle);
+        // Stages are cycle / II relative to cycle zero. Raise II enough that
+        // the largest scheduled cycle fits within stages 0 and 1.
+        int minII = std::max(computedMinII, maxAbsoluteCycle / 2 + 1);
+        auto constrained = triton::gpu::runModuloScheduling(
+            ddg, scheduleAlgo, /*maxII=*/0, /*maxBacktracks=*/20, minII);
+        if (failed(constrained))
+          break;
+        sched = *constrained;
+      }
+    }
     mlir::Builder b(module.getContext());
     for (const auto &node : ddg.getNodes()) {
       auto it = sched.nodeToCycle.find(node.idx);
@@ -1003,6 +1023,8 @@ static void runAMDModuloScaffold(ModuleOp module,
       node.op->setAttr(kModuloOrderAttr, b.getI32IntegerAttr(it->second));
     }
     os << " II=" << sched.II << " maxStage=" << sched.getMaxStage();
+    if (retryCount > 0)
+      os << " retries=" << retryCount;
 
     // E1.5: Step 4.7 + 4.8 — warp-pipeline cluster partitioning and s_setprio
     // derivation. Runs the latency-aware partition, then derives priorities
@@ -1095,21 +1117,15 @@ static void runAMDModuloScaffold(ModuleOp module,
       }
 
       triton::CoarseSchedule cs(maxStage + 1);
-      std::map<int64_t, triton::CoarseSchedule::Cluster> orderToCluster;
-      SmallVector<int64_t> orders;
-      for (Operation &op : forOp.getBody()->without_terminator())
-        orders.push_back(
-            cast<IntegerAttr>(op.getAttr("ttg.modulo_order")).getInt());
-      llvm::sort(orders);
-      orders.erase(std::unique(orders.begin(), orders.end()), orders.end());
-      for (int64_t order : orders)
-        orderToCluster.emplace(order, cs.clusters.newAtBack());
-
-      for (Operation &op : forOp.getBody()->without_terminator()) {
-        int stage = op.getAttrOfType<IntegerAttr>(kModuloStageAttr).getInt();
-        int64_t order =
-            cast<IntegerAttr>(op.getAttr("ttg.modulo_order")).getInt();
-        cs.insert(&op, stage, orderToCluster.at(order));
+      auto loadCluster = cs.clusters.newAtBack();
+      auto computeCluster = cs.clusters.newAtBack();
+      for (const auto &node : ddg.getNodes()) {
+        if (!sched.nodeToCycle.count(node.idx))
+          continue;
+        auto cluster = node.pipeline == triton::gpu::HWPipeline::GLOBAL
+                           ? loadCluster
+                           : computeCluster;
+        cs.insert(node.op, sched.getStage(node.idx), cluster);
       }
       cs.serialize(forOp);
       os << " serialized num_stages=" << cs.getNumStages();

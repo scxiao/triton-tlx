@@ -1,6 +1,7 @@
 #ifndef NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 #define NV_DIALECT_HOPPER_TRANSFORMS_CODEPARTITIONUTILITY_H_
 
+#include "nvidia/include/Dialect/NVWS/IR/Dialect.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -271,6 +272,11 @@ bool channelIsSubtiled(Channel *ch);
 // buffer.copy == 1 without misfiring on consumer-only-subtiled channels.
 bool channelIsCollapsedBothSubtiled(Channel *ch);
 
+// True when a reuse group needs a loop-carried accumulation counter. Keep this
+// predicate shared by counter counting, channel discovery, and loop rewriting
+// so collapsed subtiled groups cannot make their argument counts disagree.
+bool reuseGroupNeedsAccumCnt(ReuseGroup *group);
+
 // Skip the accumCnt for unique channels.
 unsigned getReuseAccumArgIdx(Operation *regionOp,
                              const DenseSet<Operation *> &regionsWithChannels,
@@ -302,15 +308,14 @@ void getBufferIdxAndPhase(OpBuilderWithAsyncTaskIds &builder, Operation *op,
 Value getBarrierForPipelineStage(OpBuilderWithAsyncTaskIds &builder,
                                  Value barrierAlloc, Value bufferIdx);
 
-Operation *optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
-                            SmallVector<tt::DescriptorLoadOp> &tmaLoads,
-                            SmallVector<Value> &buffers, Value barrierAlloc,
-                            Value bufferIdx, Value bufferIdxExtract,
-                            Value phase, Operation *headProducer,
-                            Operation *headConsumer,
-                            Operation *headConsumerSameLevel,
-                            ArrayRef<int> additionalConsumerTaskIds = {},
-                            DictionaryAttr consumerWaitConstraints = {});
+Operation *
+optimizeTMALoads(OpBuilderWithAsyncTaskIds &builder,
+                 SmallVector<triton::nvws::DescriptorLoadOp> &tmaLoads,
+                 Value barrierAlloc, Value bufferIdx, Value bufferIdxExtract,
+                 Value phase, Operation *headProducer, Operation *headConsumer,
+                 Operation *headConsumerSameLevel,
+                 ArrayRef<int> additionalConsumerTaskIds = {},
+                 DictionaryAttr consumerWaitConstraints = {});
 void specializeRegion(triton::FuncOp funcOp, unsigned requestedRegisters);
 Value createBufferView(OpBuilderWithAsyncTaskIds &builder, Value alloc,
                        Value idx);

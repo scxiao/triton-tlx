@@ -16,7 +16,12 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from triton.runtime.fbcode_gating import is_fbcode_dependant
 
 if is_fbcode_dependant():
-    from python.test.unit.language.conftest import _generate_test_params, _swizzle_scale_to_5d
+    try:
+        from python.test.unit.language.conftest import _generate_test_params, _swizzle_scale_to_5d
+    except ModuleNotFoundError as error:
+        if error.name != "python.test":
+            raise
+        from conftest import _generate_test_params, _swizzle_scale_to_5d
 else:
     from conftest import _generate_test_params, _swizzle_scale_to_5d
 
@@ -1344,8 +1349,9 @@ def test_async_dot_scaled_2cta(device):
 
 @pytest.mark.parametrize("A_DATA_TYPE", ["e5m2", "e4m3"])
 @pytest.mark.parametrize("B_DATA_TYPE", ["e5m2", "e4m3"])
+@pytest.mark.parametrize("N", [128, 256])
 @pytest.mark.skipif(not is_blackwell(), reason="Need Blackwell")
-def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, device):
+def test_async_dot_scaled(A_DATA_TYPE, B_DATA_TYPE, N, device):
     """
     Test D = (A * A_scale)  * (B * B_scale) with mxfp8 format for both A and B.
 

@@ -634,6 +634,7 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       GenericOpPattern<triton::gpu::LocalLoadOp>,
       GenericOpPattern<triton::gpu::LocalGatherOp>,
       GenericOpPattern<triton::gpu::LocalScatterOp>,
+      GenericOpPattern<triton::nvidia_gpu::TwoCTAPeerGatherOp>,
       GenericOpPattern<triton::nvidia_gpu::WarpGroupDotWaitOp>,
       GenericOpPattern<triton::nvidia_gpu::VoteBallotSyncOp>,
       TTNGPrefetchPattern>(typeConverter, context);
@@ -658,6 +659,10 @@ void populateTLXPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<GenericOpPattern<triton::amdgpu::BufferStoreOp>>(typeConverter,
                                                                 context);
   patterns.add<GenericOpPattern<triton::amdgpu::BufferLoadToLocalOp>>(
+      typeConverter, context);
+  patterns.add<GenericOpPattern<triton::amdgpu::AssumeUniformOp>>(typeConverter,
+                                                                  context);
+  patterns.add<GenericOpPattern<triton::amdgpu::RematerializedRangeOp>>(
       typeConverter, context);
 }
 

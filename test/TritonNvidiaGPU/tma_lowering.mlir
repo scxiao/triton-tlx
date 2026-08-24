@@ -90,14 +90,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 
 // -----
 
-#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [32, 1], warpsPerCTA = [1, 4], order = [1, 0]}>
+#offsets = #ttg.slice<{dim = 0, parent = #blocked}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #nvmma_128 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.target = "cuda:100"} {
 
 // CHECK-LABEL: @tma_gather
-tt.func @tma_gather(%arg0: !tt.tensordesc<1x128xbf16, #nvmma_128>, %arg1: tensor<32xi32, #blocked>, %arg2: i32) -> tensor<32x128xbf16, #blocked1> {
+tt.func @tma_gather(%arg0: !tt.tensordesc<1x128xbf16, #nvmma_128>, %arg1: tensor<32xi32, #offsets>, %arg2: i32) -> tensor<32x128xbf16, #blocked1> {
   // CHECK: [[RESULT:%.*]] = ttg.local_alloc
   // CHECK: [[BARRIER:%.*]] = ttg.local_alloc
   // CHECK: ttng.init_barrier [[BARRIER]]
@@ -105,18 +106,18 @@ tt.func @tma_gather(%arg0: !tt.tensordesc<1x128xbf16, #nvmma_128>, %arg1: tensor
   // CHECK: ttng.wait_barrier [[BARRIER]]
   // CHECK: ttng.inval_barrier [[BARRIER]]
   // CHECK: [[OUT:%.*]] = ttg.local_load [[RESULT]]
-  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<1x128xbf16, #nvmma_128>, tensor<32xi32, #blocked>, i32) -> tensor<32x128xbf16, #blocked1>
+  %0 = tt.descriptor_gather %arg0[%arg1, %arg2] : (!tt.tensordesc<1x128xbf16, #nvmma_128>, tensor<32xi32, #offsets>, i32) -> tensor<32x128xbf16, #blocked1>
   // CHECK: return [[OUT]]
   tt.return %0 : tensor<32x128xbf16, #blocked1>
 }
 
 // CHECK-LABEL: @tma_scatter
-tt.func @tma_scatter(%arg0: !tt.tensordesc<1x128xbf16, #nvmma_128>, %arg1: tensor<32xi32, #blocked>, %arg2: i32, %arg3: tensor<32x128xbf16, #blocked1>) {
+tt.func @tma_scatter(%arg0: !tt.tensordesc<1x128xbf16, #nvmma_128>, %arg1: tensor<32xi32, #offsets>, %arg2: i32, %arg3: tensor<32x128xbf16, #blocked1>) {
   // CHECK-NEXT: [[SRC:%.*]] = ttg.local_alloc %arg3
   // CHECK-NEXT: ttng.fence_async_shared {bCluster = false}
   // CHECK-NEXT: ttng.async_tma_scatter %arg0[%arg1, %arg2] [[SRC]]
   // CHECK-NEXT: ttng.async_tma_store_wait {pendings = 0 : i32}
-  tt.descriptor_scatter %arg0[%arg1, %arg2], %arg3 : !tt.tensordesc<1x128xbf16, #nvmma_128>, tensor<32xi32, #blocked>, i32, tensor<32x128xbf16, #blocked1>
+  tt.descriptor_scatter %arg0[%arg1, %arg2], %arg3 : !tt.tensordesc<1x128xbf16, #nvmma_128>, tensor<32xi32, #offsets>, i32, tensor<32x128xbf16, #blocked1>
   tt.return
   }
 
@@ -229,10 +230,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %c64_i32 = arith.constant 64 : i32
     // CHECK: %[[A:.+]] = ttg.local_alloc : () -> !ttg.memdesc<64x32xf32
     %0 = tt.descriptor_load %arg0[%c64_i32, %c32_i32] : !tt.tensordesc<64x32xf32, #shared> -> tensor<64x32xf32, #blocked>
-    // CHECK: %[[B:.+]] = ttg.local_load %[[A]]
-    // CHECK: %[[C:.+]] = ttg.local_alloc %[[B]]
     %1 = ttg.local_alloc %0 : (tensor<64x32xf32, #blocked>) -> !ttg.memdesc<64x32xf32, #shared1, #smem>
-    // CHECK: %[[D:.+]] = ttg.memdesc_trans %[[C]]
+    // CHECK: %[[D:.+]] = ttg.memdesc_trans %[[A]]
     %2 = ttg.memdesc_trans %1 {order = array<i32: 1, 0>} : !ttg.memdesc<64x32xf32, #shared1, #smem> -> !ttg.memdesc<32x64xf32, #shared2, #smem>
     %3 = ttg.local_alloc %0 : (tensor<64x32xf32, #blocked>) -> !ttg.memdesc<64x32xf32, #shared, #smem>
     // CHECK: %[[E:.+]] = ttg.local_load %[[D]]

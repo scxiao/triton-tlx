@@ -59,7 +59,27 @@ LogicalResult verifyMMAv5Op(Operation *op);
 
 namespace mlir::triton::nvidia_gpu {
 
+struct PackedArithTypeInfo {
+  llvm::StringLiteral suffix;
+  unsigned lanes, registerBits;
+  char kind;
+
+  bool isFP4() const { return suffix == "e2m1x4"; }
+  unsigned storageLanes() const { return isFP4() ? lanes / 2 : lanes; }
+};
+
+struct PackedArithInstructionSpec {
+  const PackedArithTypeInfo *result;
+  SmallVector<const PackedArithTypeInfo *, 3> operands;
+  StringRef modifiers;
+  unsigned operandSuffixes;
+};
+
+PackedArithInstructionSpec getPackedArithInstructionSpec(PackedArithOp op);
+unsigned getPackedArithFp4Axis(PackedArithOp op);
+
 constexpr static char AttrTwoCTAsName[] = "ttng.two-ctas";
+constexpr static char AttrTwoCTALoadName[] = "two_cta_load";
 
 inline bool getModuleTwoCTAs(ModuleOp mod) {
   auto attr = mod->getAttrOfType<BoolAttr>(AttrTwoCTAsName);
@@ -184,6 +204,20 @@ inline int getMinWarpsForOp(Operation *op) {
     return 2;
   return 1;
 }
+
+SmallVector<uint16_t> getCTABroadcastMasks(bool twoCTAs, ValueRange descs);
+
+// Compact encoding of a CTA multicast group for a given broadcast mask:
+// `fixedBits` selects the CTA-id bits that identify the group leader, and
+// `pattern` is the recipient bitset for leader CTA 0 before shifting to the
+// current group.
+struct TMAMulticastMaskEncoding {
+  uint32_t fixedBits;
+  uint32_t pattern;
+};
+
+TMAMulticastMaskEncoding getTMAMulticastMaskEncoding(int numCTAs,
+                                                     uint16_t broadcastBits);
 
 } // namespace mlir::triton::nvidia_gpu
 

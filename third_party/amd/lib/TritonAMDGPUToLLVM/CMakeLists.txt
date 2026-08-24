@@ -4,8 +4,6 @@ add_triton_library(TritonAMDGPUToLLVM
     AllocateSharedMemory.cpp
     BarrierOpConversion.cpp
     BufferOpsEmitter.cpp
-    OffsetUniformitySplit.cpp
-    UniformityAnalysis.cpp
     TensorPtrOpsToLLVM.cpp
     ConvertLayoutOpToLLVM.cpp
     ConvertWarpPipeline.cpp
@@ -25,9 +23,7 @@ add_triton_library(TritonAMDGPUToLLVM
     BuiltinFuncToLLVM.cpp
     Utility.cpp
     TargetInfo.cpp
-    TargetUtils.cpp
     SPMDOpToLLVM.cpp
-    SchedInstructions.cpp
     Fp4ToFpOpToLLVM.cpp
     MembarUtility.cpp
     ScalarizePackedFOps.cpp
@@ -43,8 +39,10 @@ add_triton_library(TritonAMDGPUToLLVM
     LINK_LIBS PUBLIC
     MLIRReconcileUnrealizedCasts
     TritonGPUToLLVM
+    TritonInstrumentToLLVM
     TritonAMDGPUIR
     TritonAMDAnalysis
+    TritonAMDUtils
     LLVMCore
     LLVMPasses
     LLVMSupport
