@@ -235,6 +235,8 @@ def test_original_kernel_correctness():
     torch.testing.assert_close(ref_out0, tri_out0, rtol=rtol, atol=atol)
     torch.testing.assert_close(ref_out1, tri_out1, rtol=rtol, atol=atol)
     torch.testing.assert_close(ref_out2, tri_out2, rtol=rtol, atol=atol)
+    
+    print(f"original_kernel_correctness: passed")
 
 
 def run_original_kernel_perf():
@@ -319,6 +321,7 @@ def test_4_buffers_correctness():
     torch.testing.assert_close(ref_out1, tri_out1, rtol=rtol, atol=atol)
     torch.testing.assert_close(ref_out2, tri_out2, rtol=rtol, atol=atol)
 
+    print(f"4_buffer_kernel_correctness: passed")
 
 def run_4_buffers_perf():
     # Configuration
