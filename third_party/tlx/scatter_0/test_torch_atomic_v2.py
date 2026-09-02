@@ -137,8 +137,7 @@ def rand_int_strided(shape, strides, *, low: int, high: int, device="cuda:0", dt
     storage = torch.randint(low, high, (storage_size,), device=device, dtype=dtype)
     return torch.as_strided(storage, size=shape, stride=strides)
 
-high_bound = 20
-def get_args():
+def get_args(high_bound):
     torch.manual_seed(1)
     arg_0 = rand_int_strided((1093610,), (1,), low=0, high=high_bound, device='cuda:0', dtype=torch.int64)
     arg_1 = rand_strided((1093610, 96), (96, 1), device='cuda:0', dtype=torch.bfloat16)
@@ -153,9 +152,9 @@ def get_args():
     return arg_0, arg_1, arg_2, arg_3, arg_4, arg_5, arg_6, 104986560
 
 
-def run_torch_naive_ref():
+def run_torch_naive_ref(high_bound):
     # torch naive run
-    kernel_args_ref = list(get_args())
+    kernel_args_ref = list(get_args(high_bound))
     torch_naive_ref(*kernel_args_ref)
     ref_out0 = kernel_args_ref[4]
     ref_out1 = kernel_args_ref[5]
@@ -164,13 +163,13 @@ def run_torch_naive_ref():
     return ref_out0, ref_out1, ref_out2
 
 
-def test_original_kernel_correctness():
+def test_original_kernel_correctness(high_bound):
     # torch reference impl
-    ref_out0, ref_out1, ref_out2 = run_torch_naive_ref()
+    ref_out0, ref_out1, ref_out2 = run_torch_naive_ref(high_bound)
 
     # triton run
     kwargs = {'num_warps': 1, 'num_stages': 1}
-    kernel_args = list(get_args())
+    kernel_args = list(get_args(high_bound))
     added_args = {'XBLOCK': 64}
     constexpr_positional_args = []
     for param_name in added_args:
@@ -194,14 +193,14 @@ def test_original_kernel_correctness():
     print(f"Original_kernel_correctness: passed")
 
 
-def test_opt_kernel_correctness():
+def test_opt_kernel_correctness(high_bound):
     # torch reference impl
-    ref_out0, ref_out1, ref_out2 = run_torch_naive_ref()
+    ref_out0, ref_out1, ref_out2 = run_torch_naive_ref(high_bound)
     
     # triton run
-    kwargs = {'num_warps': 4, 'num_stages': 1}
-    kernel_args = list(get_args())
+    kernel_args = list(get_args(high_bound))
     
+    kwargs = {'num_warps': 4, 'num_stages': 1}
     xnumel = 104986560
     d = 96
     xrows = xnumel // d
@@ -230,81 +229,136 @@ def test_opt_kernel_correctness():
     print(f"optimized_kernel_correctness: passed")
 
 
-if __name__ == '__main__':
+configs = [
+    triton.testing.Benchmark(
+        x_names = ['high_bound'],
+        x_vals = [1, 2, 4, 8, 12, 16, 20, 24, 28, 32],
+        line_arg = "provider",
+        line_vals = ['original', 'optimized'],
+        line_names = ['Orig', 'Opt'],
+        styles=[("green", "-"), ("blue", "-")],
+        ylabel="GB/s",  # Label name for the y-axis
+        plot_name="scatter-kernel-memory-bandwidth",
+        args={},  
+    )
+]
 
-    test_original_kernel_correctness()
-    test_opt_kernel_correctness()
-
-    from triton.testing import do_bench
-    import torch
-    import os
-
-    # Configuration
+@triton.testing.perf_report(configs)
+def benchmark(high_bound, provider):
+    # tensor shapes
     xnumel = 104986560
-    XBLOCK = 64
-    grid_x = (xnumel + XBLOCK - 1) // XBLOCK
-    grid = (grid_x, 1, 1)
-    kwargs = {'num_warps': 1, 'num_stages': 1}
-    num_gb = 0.23892696
-
-    # Get kernel arguments (convert to list for mutability in restore operations)
-    kernel_args = list(get_args())
-    added_args = {'XBLOCK': 64}
-
-    # Initialize CUDA device
-    cuda_device = 0
-
-    # Initialize CUDA context
-    torch.cuda.set_device(cuda_device)
-    torch.cuda.init()  # Explicitly initialize CUDA
-
-    # Create launch lambda
-    def kernel_launch():
-        with torch.cuda._DeviceGuard(cuda_device):
-            torch.cuda.set_device(cuda_device)
-            # For kernels with constexpr params in signature, append them as positional args
-            constexpr_positional_args = []
-            for param_name in added_args:
-                constexpr_positional_args.append(added_args[param_name])
-
-            return triton_poi_fused__to_copy_index_add_new_zeros_4[grid](*kernel_args, *constexpr_positional_args, **kwargs)
-
-    # Run benchmark
-    print(f"Kernel: triton_poi_fused__to_copy_index_add_new_zeros_4")
-    print(f"Grid: {grid}")
-    print()
-
-    # Measure performance
-    ms = do_bench(kernel_launch, warmup=25, rep=100)
-    print(f"Median time: {ms:.3f}ms")
-    gb_per_s = 0.23892696 / (ms / 1000.0)
-    print(f"Throughput: {gb_per_s:.1f}GB/s")
-
     d = 96
     xrows = xnumel // d
-    chunk_size = 512
-    added_args_v1 = {'CHUNK': chunk_size, 'd_next_power_2': 128, 'high_bound' : high_bound}
-    kernel_args_v1 = kernel_args
-    kernel_args_v1.append(xrows)
-    kernel_args_v1.append(d)
+
+    #original krenel args
+    orig_kwargs = {'num_warps': 1, 'num_stages': 1}
+    orig_kernel_args = list(get_args(high_bound))
+    orig_constexpr_positional_args = [64] # XBLOCK
+    XBLOCK = 64
+    orig_grid_x = (xnumel + XBLOCK - 1) // XBLOCK
+    orig_grid = (orig_grid_x, 1, 1)
+    def luanch_original_kernel():
+        triton_poi_fused__to_copy_index_add_new_zeros_4[orig_grid](*orig_kernel_args, *orig_constexpr_positional_args, **orig_kwargs)
+
+
+    # optimized kernel args
+    opt_kwargs = {'num_warps': 4, 'num_stages': 1}
+    opt_kernel_args = list(get_args(high_bound))
+    opt_kernel_args.append(xrows)
+    opt_kernel_args.append(d)
+    # opt_constexpr_positional_args = {'CHUNK': 512, 'd_next_power_2': 128, 'high_bound' : high_bound}
+    opt_constexpr_positional_args = [512, 128, high_bound]
+    CHUNK = 512
+    opt_grid_x = (xrows + CHUNK - 1) // CHUNK
+    opt_grid = (opt_grid_x, 1, 1)
+    def launch_opt_kernel():
+        triton_poi_fused__to_copy_index_add_new_zeros_4_opt_v2[opt_grid](*opt_kernel_args, *opt_constexpr_positional_args, **opt_kwargs)
+
+
+    quantiles = [0.5, 0.2, 0.8]
+    if provider == 'original':
+        ms, min_ms, max_ms = triton.testing.do_bench(luanch_original_kernel, quantiles=quantiles)
+    if provider == 'optimized':
+        ms, min_ms, max_ms = triton.testing.do_bench(launch_opt_kernel, quantiles=quantiles)
+    perf = lambda ms: 0.23892696 / (ms / 1000.0)
+    return perf(ms), perf(max_ms), perf(min_ms)
+
+
+test_original_kernel_correctness(32)
+test_opt_kernel_correctness(32)
+benchmark.run(show_plots=True, print_data=True)
     
-    grid_x = (xrows + chunk_size - 1) // chunk_size
-    grid_v1 = (grid_x, 1, 1)
+# if __name__ == '__main__':
+#     from triton.testing import do_bench
+#     import torch
+#     import os
 
-    kwargs_v1 = {'num_warps': 4, 'num_stages': 1}
-    num_gb = 0.23892696
-    def kernel_launch_v1():
-        with torch.cuda._DeviceGuard(cuda_device):
-            torch.cuda.set_device(cuda_device)
-            # For kernels with constexpr params in signature, append them as positional args
-            constexpr_positional_args_v1 = []
-            for param_name in added_args_v1:
-                constexpr_positional_args_v1.append(added_args_v1[param_name])
+#     # Configuration
+#     xnumel = 104986560
+#     XBLOCK = 64
+#     grid_x = (xnumel + XBLOCK - 1) // XBLOCK
+#     grid = (grid_x, 1, 1)
+#     kwargs = {'num_warps': 1, 'num_stages': 1}
+#     num_gb = 0.23892696
 
-            return triton_poi_fused__to_copy_index_add_new_zeros_4_opt_v2[grid_v1](*kernel_args_v1, *constexpr_positional_args_v1, **kwargs_v1)
+#     # Get kernel arguments (convert to list for mutability in restore operations)
+#     kernel_args = list(get_args())
+#     added_args = {'XBLOCK': 64}
 
-    ms_v1 = do_bench(kernel_launch_v1, warmup=25, rep=100)
-    print(f"\nImproved Version_1")
-    print(f"Median time: {ms_v1:.3f}ms")
-    gb_per_s_v1 = 0.23892696 / (ms_v1 / 1000.0)
-    print(f"Throughput: {gb_per_s_v1:.1f}GB/s")
+#     # Initialize CUDA device
+#     cuda_device = 0
+
+#     # Initialize CUDA context
+#     torch.cuda.set_device(cuda_device)
+#     torch.cuda.init()  # Explicitly initialize CUDA
+
+#     # Create launch lambda
+#     def kernel_launch():
+#         with torch.cuda._DeviceGuard(cuda_device):
+#             torch.cuda.set_device(cuda_device)
+#             # For kernels with constexpr params in signature, append them as positional args
+#             constexpr_positional_args = []
+#             for param_name in added_args:
+#                 constexpr_positional_args.append(added_args[param_name])
+
+#             return triton_poi_fused__to_copy_index_add_new_zeros_4[grid](*kernel_args, *constexpr_positional_args, **kwargs)
+
+#     # Run benchmark
+#     print(f"Kernel: triton_poi_fused__to_copy_index_add_new_zeros_4")
+#     print(f"Grid: {grid}")
+#     print()
+
+#     # Measure performance
+#     ms = do_bench(kernel_launch, warmup=25, rep=100)
+#     print(f"Median time: {ms:.3f}ms")
+#     gb_per_s = 0.23892696 / (ms / 1000.0)
+#     print(f"Throughput: {gb_per_s:.1f}GB/s")
+
+#     d = 96
+#     xrows = xnumel // d
+#     chunk_size = 512
+#     added_args_v1 = {'CHUNK': chunk_size, 'd_next_power_2': 128, 'high_bound' : high_bound}
+#     kernel_args_v1 = kernel_args
+#     kernel_args_v1.append(xrows)
+#     kernel_args_v1.append(d)
+    
+#     grid_x = (xrows + chunk_size - 1) // chunk_size
+#     grid_v1 = (grid_x, 1, 1)
+
+#     kwargs_v1 = {'num_warps': 4, 'num_stages': 1}
+#     num_gb = 0.23892696
+#     def kernel_launch_v1():
+#         with torch.cuda._DeviceGuard(cuda_device):
+#             torch.cuda.set_device(cuda_device)
+#             # For kernels with constexpr params in signature, append them as positional args
+#             constexpr_positional_args_v1 = []
+#             for param_name in added_args_v1:
+#                 constexpr_positional_args_v1.append(added_args_v1[param_name])
+
+#             return triton_poi_fused__to_copy_index_add_new_zeros_4_opt_v2[grid_v1](*kernel_args_v1, *constexpr_positional_args_v1, **kwargs_v1)
+
+#     ms_v1 = do_bench(kernel_launch_v1, warmup=25, rep=100)
+#     print(f"\nImproved Version_1")
+#     print(f"Median time: {ms_v1:.3f}ms")
+#     gb_per_s_v1 = 0.23892696 / (ms_v1 / 1000.0)
+#     print(f"Throughput: {gb_per_s_v1:.1f}GB/s")
