@@ -27,6 +27,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
@@ -86,7 +87,8 @@ static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
 
       Location loc = block.front().getLoc();
       OpBuilder startBuilder(&block.front());
-      ROCDL::SchedBarrier::create(startBuilder, loc, /*mask=*/0);
+      ROCDL::SchedBarrier::create(startBuilder, loc,
+                                  ROCDL::SchedGroupMask::none);
 
       for (auto [regionIndex, pair] :
            llvm::enumerate(llvm::zip(regions, boundaries))) {
@@ -152,7 +154,7 @@ static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
           unsigned cover = anchor.mask == (1 << 5)   ? anchor.mfmaCover
                            : anchor.mask == (1 << 8) ? 1
                            : anchor.mask == (1 << 9) ? writeCover
-                                                    : 0;
+                                                     : 0;
           for (unsigned i = 0; i < anchor.count; ++i)
             groups.push_back({anchor.mask, mfmas ? cover : 0});
         }
@@ -160,17 +162,21 @@ static void materializeDeferredSchedGroupBarriers(ModuleOp mod) {
         OpBuilder builder(boundary);
         unsigned syncId = nextSyncId++;
         for (const Group &group : groups) {
-          ROCDL::SchedGroupBarrier::create(builder, loc, group.mask, 1, syncId);
+          ROCDL::SchedGroupBarrier::create(
+              builder, loc, static_cast<ROCDL::SchedGroupMask>(group.mask), 1,
+              syncId);
           if (group.cover)
-            ROCDL::SchedGroupBarrier::create(builder, loc, 1 << 3, group.cover,
-                                             syncId);
+            ROCDL::SchedGroupBarrier::create(builder, loc,
+                                             ROCDL::SchedGroupMask::mfma_wmma,
+                                             group.cover, syncId);
         }
         if (regionIndex + 1 < regions.size())
-          ROCDL::SchedBarrier::create(builder, loc, /*mask=*/0);
+          ROCDL::SchedBarrier::create(builder, loc,
+                                      ROCDL::SchedGroupMask::none);
       }
 
       OpBuilder endBuilder(block.getTerminator());
-      ROCDL::SchedBarrier::create(endBuilder, loc, /*mask=*/0);
+      ROCDL::SchedBarrier::create(endBuilder, loc, ROCDL::SchedGroupMask::none);
     }
   });
 }
@@ -204,8 +210,54 @@ public:
     addLegalOp<triton::gpu::WarpYieldOp>();
     addLegalOp<triton::gpu::WarpSpecializePartitionsOp>();
     addLegalOp<triton::gpu::WarpReturnOp>();
+    // Predicated regions are lowered after their bodies have been converted
+    // to LLVM by TritonAMDGPUConvertWarpSpecializeToLLVM.
+    addLegalOp<triton::gpu::WarpPredicateOp>();
+    addLegalOp<triton::gpu::PredicateYieldOp>();
+    // These have no lowering after this pass, so a pattern that bails out
+    // must fail the conversion instead of leaving the op behind. The rest of
+    // the dialect stays unmarked: some of it is lowered later.
+    addIllegalOp<triton::amdgpu::ScheduledMfmaOp>();
+    addIllegalOp<triton::amdgpu::MfmaCommitOp>();
   }
 };
+
+// TLX layout propagation is allowed to create captured or yielded
+// convert_layout operations temporarily while it reconciles a predicate
+// body's native layout with its carried values. By LLVM lowering, every such
+// cross-lane conversion must have moved outside a non-wave-uniform region.
+// Otherwise its shuffle would execute after EXEC is restricted and could read
+// inactive lanes.
+static LogicalResult validateFinalWarpPredicateLayouts(ModuleOp mod) {
+  WalkResult result = mod.walk([&](triton::gpu::WarpPredicateOp predicateOp) {
+    if (predicateOp.getWaveUniform().value_or(false))
+      return WalkResult::advance();
+
+    triton::gpu::ConvertLayoutOp unsafeConvert;
+    predicateOp.getRegion().walk([&](Operation *nested) {
+      if (nested != predicateOp.getOperation() &&
+          isa<triton::gpu::WarpPredicateOp>(nested))
+        return WalkResult::skip();
+      auto convert = dyn_cast<triton::gpu::ConvertLayoutOp>(nested);
+      if (!convert)
+        return WalkResult::advance();
+      auto srcType = cast<RankedTensorType>(convert.getSrc().getType());
+      auto dstType = cast<RankedTensorType>(convert.getType());
+      if (triton::gpu::toLinearLayout(srcType) ==
+          triton::gpu::toLinearLayout(dstType))
+        return WalkResult::advance();
+      unsafeConvert = convert;
+      return WalkResult::interrupt();
+    });
+
+    if (!unsafeConvert)
+      return WalkResult::advance();
+    predicateOp.emitError(
+        "non-wave-uniform body still contains cross-lane layout conversion");
+    return WalkResult::interrupt();
+  });
+  return failure(result.wasInterrupted());
+}
 
 struct ConvertTritonAMDGPUToLLVM
     : public triton::impl::ConvertTritonAMDGPUToLLVMBase<
@@ -213,6 +265,13 @@ struct ConvertTritonAMDGPUToLLVM
   explicit ConvertTritonAMDGPUToLLVM(StringRef gfxArch, bool ftz) {
     this->gfxArch = gfxArch.str();
     this->ftz = ftz;
+  }
+
+  ConvertTritonAMDGPUToLLVM(StringRef gfxArch, bool ftz,
+                            bool enableTreeReduction) {
+    this->gfxArch = gfxArch.str();
+    this->ftz = ftz;
+    this->enableTreeReduction = enableTreeReduction;
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -224,6 +283,9 @@ struct ConvertTritonAMDGPUToLLVM
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
+
+    if (failed(validateFinalWarpPredicateLayouts(mod)))
+      return signalPassFailure();
 
     AMD::TargetInfo targetInfo(this->gfxArch.getValue());
     if (targetInfo.getISAFamily() == triton::amdgpu::ISAFamily::Unknown) {
@@ -321,8 +383,9 @@ struct ConvertTritonAMDGPUToLLVM
     AMD::populateTensorPtrOpsToLLVMPatterns(typeConverter, patterns,
                                             AMDBenefit);
 
-    populatePatterns7(mlir::triton::populateReduceOpToLLVMPatterns,
-                      commonBenefit);
+    mlir::triton::populateReduceOpToLLVMPatternsWithOptions(
+        typeConverter, patterns, targetInfo, commonBenefit,
+        enableTreeReduction);
     populatePatterns7(mlir::triton::populateScanOpToLLVMPatterns,
                       commonBenefit);
     populatePatterns5(mlir::triton::populateViewOpToLLVMPatterns,
@@ -423,6 +486,13 @@ namespace mlir::triton {
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz) {
   return std::make_unique<ConvertTritonAMDGPUToLLVM>(gfxArch, ftz);
+}
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz,
+                                    bool enableTreeReduction) {
+  return std::make_unique<ConvertTritonAMDGPUToLLVM>(gfxArch, ftz,
+                                                     enableTreeReduction);
 }
 
 } // namespace mlir::triton

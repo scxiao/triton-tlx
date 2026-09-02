@@ -83,7 +83,8 @@ def get_ptxas_version(arch: int = 80):
     mock_ver = knobs.nvidia.mock_ptx_version
     if mock_ver is not None:
         return mock_ver  # This is not really a version of ptxas, but it is good enough for testing
-    version = subprocess.check_output([get_ptxas(arch).path, "--version"]).decode("utf-8")
+    version = subprocess.check_output([get_ptxas(arch).path, "--version"],
+                                      env=knobs.nvidia.get_tool_env()).decode("utf-8")
     return version
 
 
@@ -232,12 +233,15 @@ class CUDAOptions:
     tma_store_pipelining: Optional[bool] = None
     generate_subtiled_region: bool = False
     multicast: bool = False
+    allowDependentTwoCTA: bool = False
     # Per-config auto-TMA toggle (autotunable). Falls back to the global
     # TRITON_AUTO_TMA knob when left at the default in make_ttir.
     auto_tma: bool = False
     # Emit device-side descriptors (make_tensor_descriptor + descriptor_load/store)
     # instead of host TMA recipes. Falls back to knobs.nvidia.auto_tma_device.
     auto_tma_device: bool = False
+    enable_tree_reduction: bool = False
+    enable_nvptx_v2i32: bool = False
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / "lib"
@@ -256,16 +260,26 @@ class CUDAOptions:
         _check_reg_auto_ws_alignment("minRegAutoWS", self.minRegAutoWS)
         _check_reg_auto_ws_alignment("maxRegAutoWS", self.maxRegAutoWS)
 
-        # If ctas_per_cga is set, it overrides cluster_dims with CUDA semantics:
-        # ctas_per_cga defines the cluster shape for regrouping grid CTAs.
-        # num_ctas must be 1 when using ctas_per_cga since it's incompatible with
-        # the multiplicative semantics of num_ctas.
-        if self.ctas_per_cga is not None:
-            # Ensure cluster_dims is all 1s to prevent conflicting cluster specifications.
-            assert (self.cluster_dims == (1, 1, 1) or self.cluster_dims == self.ctas_per_cga), (
-                f"When using ctas_per_cga, cluster_dims must be default (1,1,1) or match ctas_per_cga to avoid conflicting "
-                f"cluster specifications. Got cluster_dims={self.cluster_dims}")
+        # num_ctas and ctas_per_cga are alternative cluster models, not two dials
+        # on one. Under num_ctas the CTAs share a program and its tensors are
+        # distributed across them; under ctas_per_cga each CTA is its own program
+        # and only explicit ops cross between them. The compiler decides which
+        # model a kernel uses by inspecting these, so requesting a cluster more
+        # than one way has no well-defined answer. cluster_dims is the
+        # module-level spelling of the ctas_per_cga shape, so those two may
+        # coexist only when they agree.
+        cluster_shape = self.ctas_per_cga if self.ctas_per_cga is not None else self.cluster_dims
+        mirrors_agree = self.ctas_per_cga is None or self.cluster_dims in ((1, 1, 1), self.ctas_per_cga)
+        if not mirrors_agree or (self.num_ctas > 1 and cluster_shape != (1, 1, 1)):
+            raise ValueError("a cluster must be requested exactly one way: either num_ctas, or ctas_per_cga "
+                             f"(optionally mirrored in cluster_dims). Got num_ctas={self.num_ctas}, "
+                             f"ctas_per_cga={self.ctas_per_cga}, cluster_dims={self.cluster_dims}")
 
+        # ctas_per_cga regroups grid CTAs rather than spawning them, so it is
+        # incompatible with the multiplicative semantics of num_ctas. Mirror it
+        # into cluster_dims, which is what reaches the module as
+        # ttg.cluster-dim-*.
+        if self.ctas_per_cga is not None:
             object.__setattr__(self, "cluster_dims", self.ctas_per_cga)
             object.__setattr__(self, "num_ctas", 1)
 
@@ -311,6 +325,11 @@ class CUDABackend(BaseBackend):
         args = {"arch": knobs.runtime.override_arch or f"sm{self.target.arch}"}
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
+
+        if "enable_tree_reduction" not in args:
+            # Preserve the established ordering before Blackwell while using
+            # linear ordering for the Blackwell workloads it targets.
+            args["enable_tree_reduction"] = capability < 100
 
         if args.get("num_ctas", 1) > 1 and capability < 90:
             raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
@@ -842,7 +861,7 @@ class CUDABackend(BaseBackend):
         # dot dependencies into TMEM alloc/load/store chains.
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
-            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
+            nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm, opt.allowDependentTwoCTA)
         # optimize TTGIR
         ptx_version = get_ptx_version_from_options(opt, capability)
         max_vec_bits = 256 if capability >= 100 and ptx_version >= 88 else 128
@@ -862,6 +881,9 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm, 0)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None and opt.allowDependentTwoCTA):
+            nvidia.passes.hopper.add_analyze_2cta_dependencies(pm)
         # 2-CTA: Split B descriptor loads before optimize_descriptor_encoding
         # so the cloned half-width descriptor gets its encoding set properly.
         # NOT gated on use_meta_ws: the ctas_per_cga approach bypasses PlanCTA
@@ -871,7 +893,11 @@ class CUDABackend(BaseBackend):
         if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
                 and opt.ctas_per_cga is not None):
             nvidia.passes.hopper.add_2cta_transform_loads(pm)
+        if (capability // 10 >= 10 and opt.cluster_dims is not None and max(opt.cluster_dims) >= 2
+                and opt.ctas_per_cga is not None and opt.allowDependentTwoCTA):
+            nvidia.passes.hopper.add_plan_2cta_exchange(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
+        nvidia.passes.ttnvgpuir.add_tma_multicast(pm)
         passes.ttir.add_loop_aware_cse(pm)
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -996,8 +1022,20 @@ class CUDABackend(BaseBackend):
                     knobs.nvidia.ws_tile_prefetch_depth,
                     tma_store_pipelining,
                 )
+                # AutoWS clones the original partial schedule into each
+                # partition. Re-schedule those cloned loops so newly inserted
+                # partition-local ops receive stages and unused stages are
+                # pruned before software-pipeline expansion.
+                # Restrict it to the 2-CTA path: on the 1-CTA path the post-WS
+                # schedule is already correct and re-running the scheduler
+                # overwrites it, which silently miscompiles kernels that have a
+                # separate epilogue-store partition.
+                if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2:
+                    passes.ttgpuir.add_schedule_loops(pm, opt.num_stages, knobs.nvidia.use_meta_ws)
             passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
             passes.ttgpuir.add_optimize_partition_warps(pm)
+            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and opt.allowDependentTwoCTA):
+                nvidia.passes.hopper.add_materialize_2cta_exchange(pm)
             passes.ttgpuir.add_combine_tensor_select_and_if(pm)
             # hoist again and allow hoisting out of if statements
             passes.ttgpuir.add_hoist_tmem_alloc(pm, True)
@@ -1009,7 +1047,7 @@ class CUDABackend(BaseBackend):
             # 2-CTA: Insert cross-CTA sync AFTER all WS passes.
             # Only for Meta WS path — non-WS 2-CTA sync is handled by
             # MMAv5.cpp's inline ClusterArriveOp.
-            if (opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws):
+            if opt.cluster_dims is not None and max(opt.cluster_dims) >= 2 and knobs.nvidia.use_meta_ws:
                 nvidia.passes.hopper.add_insert_2cta_sync(pm)
         else:
             passes.ttir.add_triton_licm(pm)
@@ -1046,7 +1084,7 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         if "fpsan" in opt.instrumentation_mode:
             passes.ttgpuir.add_fp_sanitizer(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+            passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
         # Budget-aware layout conversion elimination — runs last to ensure
@@ -1054,6 +1092,8 @@ class CUDABackend(BaseBackend):
         # after all other passes that may introduce layout conversions.
         terminal_smem_budget = (0 if knobs.nvidia.disable_budget_aware_layout_conversion else smem_budget)
         passes.ttgpuir.add_remove_layout_conversions(pm, terminal_smem_budget)
+        # add_remove_layout_conversions needs a CSE after it.
+        passes.ttir.add_loop_aware_cse(pm)
         # Retire user-pinned register layout markers (#tlx.user_layout) only after
         # ALL layout-rewriting passes have run (optimize_tmem_layouts reads the
         # marker; every remove_layout_conversions / reduce_data_duplication above
@@ -1112,7 +1152,7 @@ class CUDABackend(BaseBackend):
         if "fpsan" in options.instrumentation_mode:
             passes.ttgpuir.add_fp_sanitizer(pm)
         if any(mode in options.instrumentation_mode for mode in ["consan", "fpsan"]):
-            passes.ttgpuir.add_remove_layout_conversions(pm, 0)
+            passes.ttgpuir.add_remove_layout_conversions(pm, 0, True)
             passes.common.add_canonicalizer(pm)
             passes.common.add_cse(pm)
 
@@ -1140,7 +1180,12 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_prepare_consan_captures(pm, "nvidia")
         nvidia.passes.ttnvgpuir.add_allocate_tensor_memory(pm)
         nvidia.passes.ttgpuir.add_allocate_shared_memory_nv(pm, capability, ptx_version)
-        nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm)
+        nvidia.passes.ttnvgpuir.add_check_matmul_two_cta(pm, options.allowDependentTwoCTA)
+        if "consan" in options.instrumentation_mode:
+            # Call ConcurrencySanitizerPass here, before allocating global scratch memory but after allocating tensor and shared
+            passes.ttgpuir.add_concurrency_sanitizer(pm)
+            passes.gluon.add_canonicalizer(pm)
+            passes.common.add_cse(pm)
         if "gsan" in options.instrumentation_mode:
             passes.ttgpuir.add_global_sanitizer(pm)
         # Print TTGIR to TLX mapping before final emission (for debugging/analysis)
@@ -1159,7 +1204,13 @@ class CUDABackend(BaseBackend):
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
         nvidia.passes.hopper.add_tma_store_token_wait_lowering(pm)
         nvidia.passes.ttnvgpuir.add_tmem_barrier_insertion(pm)
-        nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version, "consan" in options.instrumentation_mode)
+        nvidia.passes.ttgpuir.add_to_llvmir(
+            pm,
+            capability,
+            ptx_version,
+            "consan" in options.instrumentation_mode,
+            options.enable_tree_reduction,
+        )
         nvidia.passes.ttnvgpuir.add_initialize_ws_cluster_barriers(pm, capability, ptx_version)
         passes.ttgpuir.add_canonicalize_llvm_ir(pm)
         passes.common.add_cse(pm)
@@ -1237,7 +1288,7 @@ class CUDABackend(BaseBackend):
             paths = [path for (name, path) in options.extern_libs]
             llvm.link_extern_libs(llvm_mod, paths)
 
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
+        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, scalarize_packed_fops=True)
 
         # Get some metadata
         # warp-specialization mutates num_warps
@@ -1268,6 +1319,8 @@ class CUDABackend(BaseBackend):
         proc = sm_arch_from_capability(cap_llvm)
         features = get_features(opt, cap_llvm)
         flags = ["nvptx-mad-wide-opt"]
+        if opt.enable_nvptx_v2i32:
+            flags.append("nvptx-v2i32")
         canonicalize_gep = "fpsan" in opt.instrumentation_mode
         ret = llvm.translate_to_asm(src, triple, proc, features, flags, opt.enable_fp_fusion, False, canonicalize_gep)
         # Find kernel names (there should only be one)
@@ -1358,7 +1411,7 @@ class CUDABackend(BaseBackend):
                 fbin,
             ]
             try:
-                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog)
+                subprocess.run(ptxas_cmd, check=True, close_fds=False, stderr=flog, env=knobs.nvidia.get_tool_env())
                 if knobs.nvidia.dump_ptxas_log:
                     with open(flog.name) as log_file:
                         print(log_file.read())

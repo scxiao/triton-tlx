@@ -22,6 +22,27 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.shar
 
 // -----
 
+#scale_offsets = #ttg.generic_linear<{register = [[1, 0], [2, 0]], lane = [[4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 1]], warp = [[0, 2], [16, 4], [0, 0]], block = []}>
+#scale_shared = #ttg.shared_linear<{offset = [[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [64, 0], [0, 1], [0, 2], [16, 4]]}, alignment = 16>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 8 : i32, ttg.shared = 0 : i32, ttg.target = "hip:gfx950", "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: buffer_load_to_local_shared_linear_direct_mapping
+  tt.func public @buffer_load_to_local_shared_linear_direct_mapping(
+      %ptr: !tt.ptr<i8> {tt.divisibility = 16 : i32, tt.pointer_range = 32 : i32},
+      %offsets: tensor<128x8xi32, #scale_offsets> {tt.contiguity = dense<[128, 1]> : tensor<2xi32>, tt.divisibility = dense<[16, 1]> : tensor<2xi32>, tt.constancy = dense<[1, 1]> : tensor<2xi32>},
+      %dst: !ttg.memdesc<128x8xi8, #scale_shared, #smem, mutable>) {
+    // The source distribution and shared layout describe the same physical
+    // swizzle, so lowering writes the final LDS image directly.
+    // COMMON-NOT: rocdl.ds_bpermute
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds
+    // COMMON-NOT: rocdl.ds_bpermute
+    %0 = amdg.buffer_load_to_local %ptr[%offsets] into %dst : <i8>[tensor<128x8xi32, #scale_offsets>] -> <128x8xi8, #scale_shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
 #blocked = #ttg.blocked<{sizePerThread = [2, 1], threadsPerWarp = [32, 2], warpsPerCTA = [1, 32], order = [0, 1]}>
 #shared = #ttg.swizzled_shared<{vec = 2, perPhase = 1, maxPhase = 1, order = [0, 1]}>
 #smem = #ttg.shared_memory
@@ -190,17 +211,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     // Match the i32 select used to compute voffset
     // COMMON: %[[VOFFSET:.*]] = llvm.select {{.*}} : i1, i32
     // COMMON: %[[IMM0:.*]] = llvm.mlir.constant(0 : i32) : i32
-    // COMMON: %[[aux_ca:.*]] = llvm.mlir.constant(0 : i32) : i32
     // COMMON: %[[IMM1:.*]] = llvm.mlir.constant(0 : i32) : i32
-    // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, %[[VOFFSET]], %[[IMM1]], %[[IMM0]], %[[aux_ca]]
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, %[[VOFFSET]], %[[IMM0]], %[[IMM1]], 0
     %1 = amdg.buffer_load_to_local %arg0[%0] cacheModifier = ca into %arg2: <f32>[tensor<64xi32, #blocked>] -> <64xf32, #shared, #smem, mutable>
     // COMMON: llvm.getelementptr
-    // COMMON: %[[aux_cg:.*]] = llvm.mlir.constant(3 : i32) : i32
-    // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, %[[aux_cg]]
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, 3
     %2 = amdg.buffer_load_to_local %arg0[%0] cacheModifier = cg into %arg2: <f32>[tensor<64xi32, #blocked>] -> <64xf32, #shared, #smem, mutable>
     // COMMON: llvm.getelementptr
-    // COMMON: %[[aux_cv:.*]] = llvm.mlir.constant(17 : i32) : i32
-    // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, %[[aux_cv]]
+    // COMMON: rocdl.raw.ptr.buffer.load.async.lds {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, {{.*}}, 17
     %3 = amdg.buffer_load_to_local %arg0[%0] cacheModifier = cv into %arg2: <f32>[tensor<64xi32, #blocked>] -> <64xf32, #shared, #smem, mutable>
 
     tt.return

@@ -717,18 +717,20 @@ unsigned getContiguity(Value ptr, Value offset,
   auto elemNumBytes = std::max<unsigned>(elemNumBits / 8, 1);
   auto align = std::max<unsigned>(maxMultipleBytes / elemNumBytes, 1);
 
-  // The layout's contigPerThread is the primary contiguity bound. The offset
-  // divisibility is NOT used here: for buffer loads, the offset along the fast
-  // axis is a contiguous range (e.g. row_base + arange(N)), whose element-GCD
-  // is always 1, which would incorrectly cap vectorization.  The alignment of
-  // the first element of each group (row_base) is already captured by the
-  // coalesce pass via the layout's sizePerThread, so contigPerThread is the
-  // right bound.
-  auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
-  auto llAttr = triton::gpu::LinearEncodingAttr::get(tensorTy.getContext(),
-                                                     std::move(linearLayout));
+  // FIXME (Alex): this should not be needed anymore because it's done inside
+  // getContiguity, but we have an order issues with LL, so we keep this
+  // until the LL order issue is fixed
+  SmallVector<unsigned> contigPerThread;
+  if (auto llAttr =
+          dyn_cast<triton::gpu::LinearEncodingTrait>(tensorTy.getEncoding())) {
+    contigPerThread = llAttr.getContigPerThread();
+  } else {
+    auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
+    auto fallbackAttr = triton::gpu::LinearEncodingAttr::get(
+        tensorTy.getContext(), std::move(linearLayout));
+    contigPerThread = fallbackAttr.getContigPerThread();
+  }
   auto order = triton::gpu::getOrder(tensorTy);
-  auto contigPerThread = llAttr.getContigPerThread();
   assert(order[0] < contigPerThread.size() &&
          "Unexpected contigPerThread size");
   unsigned contiguity = contigPerThread[order[0]];

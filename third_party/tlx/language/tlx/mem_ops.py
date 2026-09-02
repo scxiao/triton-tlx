@@ -818,26 +818,46 @@ def subslice(
 @tl.builtin
 def local_slice(
     buffer: tlx.buffered_tensor,
-    offset: list[int],
+    offset: list[int | tl.tensor],
     shape: list[int],
     _semantic=None,
 ) -> tlx.buffered_tensor:
+    """Return a same-rank local-memory subview.
+
+    SMEM offsets may be integers, constexprs, or runtime scalar i32 tensors.
+    When any offset is runtime-valued, the dynamic subslice IR operation is
+    used. Runtime offsets must keep the view within the source allocation and
+    satisfy the same tile-alignment contract as static offsets; violating
+    either condition is undefined behavior.
+    """
+    has_runtime_offset = any(isinstance(value, tl.tensor) for value in offset)
     if buffer.type.storage == tlx.storage_kind.tmem:
         # TMEM can only slice along the innermost dimension
+        assert not has_runtime_offset, "runtime local_slice offsets are only supported for SMEM"
         assert len(offset) == 2 and len(shape) == 2
         assert offset[0] == 0
         assert shape[0] == buffer.type.shape[0]
         return subslice(buffer, offset[1], shape[1], _semantic=_semantic)
+
+    if has_runtime_offset:
+        assert buffer.type.storage == tlx.storage_kind.smem, "runtime local_slice offsets are only supported for SMEM"
+        unwrapped_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+        assert len(offset) == len(
+            buffer.type.shape) == len(unwrapped_shape), "local_slice offset and shape must match the source rank"
+        offset_handles = [_semantic._convert_elem_to_ir_value(value, require_i64=False) for value in offset]
+        slice_handle = _semantic.builder.create_memdesc_dynamic_subslice(buffer.handle, offset_handles, unwrapped_shape)
+        shape = unwrapped_shape
     else:
         slice_handle = _semantic.builder.create_memdesc_subslice(buffer.handle, offset, shape)
-        return tlx.buffered_tensor(
-            slice_handle,
-            buffer.type.scalar,
-            shape,
-            0,
-            buffer.type.storage,
-            buffer.type.layout,
-        )
+
+    return tlx.buffered_tensor(
+        slice_handle,
+        buffer.type.scalar,
+        shape,
+        0,
+        buffer.type.storage,
+        buffer.type.layout,
+    )
 
 
 @tl.builtin
@@ -856,6 +876,9 @@ def async_load(
 ) -> tlx.async_token:
     """
     Loads buffer from global to local memory asynchronously.
+
+    When ``mask`` is provided and ``other`` is omitted, masked destination
+    elements are filled with zero.
 
     When ``bulk=True``, emits a single ``cp.async.bulk`` instruction instead of
     per-thread ``cp.async`` copies. Requirements for bulk mode:
@@ -918,9 +941,11 @@ def async_load(
     assert bulk_size is None, "bulk_size requires bulk=True"
     assert barrier is None, "barrier requires bulk=True"
 
-    # Unwrap constexpr and convert to tensor (same as tl.load)
+    # Unwrap constexpr, apply the TLX zero-fill default, and convert to tensor.
     mask = tl._unwrap_if_constexpr(mask)
     other = tl._unwrap_if_constexpr(other)
+    if mask is not None and other is None:
+        other = 0.0
     if mask is not None:
         mask = _semantic.to_tensor(mask)
     if other is not None:
@@ -992,9 +1017,24 @@ def local_load(
     """
     Loads buffer from local or tensor memory into a distributed tensor.
 
+    ``token`` (optional) carries an explicit async-wait dependency to the load.
+
     ``layout`` (optional) pins the register layout of the loaded value, written
     as a ``tlx.layout(...)`` (Shape:Stride). It is mapped to a ``#linear``
     encoding so the compiler propagates it back and avoids ``convert_layout``.
+
+    ``relaxed=False`` does not infer or insert an async wait. Without a
+    ``token``, AMD lowering retains conservative producer-to-consumer
+    dependency and wait-count tracking. The caller must issue an async wait
+    before consuming a tile produced by asynchronous copies.
+
+    ``relaxed=True`` tells AMD lowering that a preceding async wait already
+    orders the LDS load after its async producer, avoiding a redundant
+    producer-to-consumer dependency and wait count when no ``token`` is
+    threaded to the load. Membar analysis materializes the workgroup barrier
+    required after the memory-wait operation. This marker does not release the
+    tile for a later refill: reusing the same LDS slice still requires the
+    consumer-to-refill workgroup barrier inferred by membar analysis.
 
     ``rematerialize_coordinates=True`` starts fresh lane/warp address live
     ranges at this load. This can avoid keeping a cheap LDS address live
@@ -1397,7 +1437,7 @@ def async_descriptor_load(
         cache,
         eviction,
         False,
-        two_ctas,
+        bool(two_ctas),
     )
 
 
@@ -1573,6 +1613,61 @@ def async_amd_descriptor_load(
         positioned_desc,
         result.handle,
         None,
+    )
+    return tlx.async_token(token_handle)
+
+
+@tl.builtin
+def async_amd_descriptor_load_fused(
+    members,
+    cache_modifier: str = "",
+    _semantic=None,
+) -> tlx.async_token:
+    """Emit one fused AMD TDM load for two to four members.
+
+    Each member is ``(positioned_desc, destination, warp_used_hint)``. The
+    descriptor must already carry its tile offsets, predicate, and bounds; use
+    :func:`update_tensor_descriptor` before this operation when needed. Member
+    hints must be legal, pairwise-disjoint bitmasks. All members share one
+    cache modifier.
+    """
+    arch = _semantic.builder.options.arch
+    assert is_amd_tdm_target(arch), (
+        f"async_amd_descriptor_load_fused is only available on AMD TDM-capable targets, got arch={arch}")
+    members = tl._unwrap_if_constexpr(members)
+    if not 2 <= len(members) <= 4:
+        raise ValueError(f"async_amd_descriptor_load_fused requires 2 to 4 members, got {len(members)}")
+
+    desc_handles = []
+    dest_handles = []
+    warp_used_hints = []
+    rank = None
+    for index, member in enumerate(members):
+        member = tl._unwrap_if_constexpr(member)
+        if len(member) != 3:
+            raise ValueError("fused TDM members must be (descriptor, destination, warp_used_hint) tuples")
+        desc, dest, warp_used_hint = member
+        if not isinstance(desc, tl.tensor_descriptor_base):
+            raise TypeError(f"fused TDM member {index}: expected a tensor descriptor")
+        if not isinstance(dest, tlx.buffered_tensor):
+            raise TypeError(f"fused TDM member {index}: expected a buffered tensor destination")
+        if rank is None:
+            rank = len(desc.block_shape)
+        if len(desc.block_shape) != rank:
+            raise ValueError("fused TDM requires all descriptors to have the same rank")
+        warp_used_hint = tl._unwrap_if_constexpr(warp_used_hint)
+        if warp_used_hint is None:
+            raise ValueError(f"fused TDM member {index}: warp_used_hint is required")
+        desc_handles.append(desc.handle)
+        dest_handles.append(dest.handle)
+        warp_used_hints.append(int(warp_used_hint))
+
+    cache = _semantic._str_to_load_cache_modifier(cache_modifier)
+    token_handle = _semantic.builder.create_async_tdm_fused_copy_global_to_local(
+        desc_handles,
+        dest_handles,
+        warp_used_hints,
+        cache,
     )
     return tlx.async_token(token_handle)
 
